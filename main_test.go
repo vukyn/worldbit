@@ -120,13 +120,47 @@ func TestInvalidConfigFailsBeforeRunning(t *testing.T) {
 	}
 }
 
-// TestGUIDispatchIsStubbed documents the current mode dispatch: without
-// --headless the run goes to runGUI, which is a stub in both build-tag
-// variants until the viewer lands.
-func TestGUIDispatchIsStubbed(t *testing.T) {
-	err := newApp().Run([]string{"worldbit", "--seed", "3"})
-	if err == nil {
-		t.Fatal("the GUI stub reported success")
+// TestExpectHashParsing covers the replay check's one piece of input handling.
+//
+// The rejection cases matter more than the acceptance ones: a mistyped
+// --expect-hash that was quietly treated as "no expectation given" would turn a
+// failed determinism check into a run that simply looked fine, which is the
+// exact failure this whole project exists to make impossible.
+//
+// The dispatch this flag feeds — no --headless means the viewer — is covered in
+// main_nogui_test.go, on the build where running it does not try to open a
+// window.
+func TestExpectHashParsing(t *testing.T) {
+	accepted := []struct {
+		text string
+		want uint64
+	}{
+		{text: "", want: 0},
+		{text: "0", want: 0},
+		{text: "3f9a2b1c4d5e6f70", want: 0x3f9a2b1c4d5e6f70},
+		{text: "0x3f9a2b1c4d5e6f70", want: 0x3f9a2b1c4d5e6f70},
+		{text: "0XFFFFFFFFFFFFFFFF", want: 0xffffffffffffffff},
+	}
+	for _, testCase := range accepted {
+		hash, present, err := parseExpectHash(testCase.text)
+		if err != nil {
+			t.Errorf("parseExpectHash(%q): %v", testCase.text, err)
+			continue
+		}
+		if want := testCase.text != ""; present != want {
+			t.Errorf("parseExpectHash(%q) present %v, want %v", testCase.text, present, want)
+		}
+		if hash != testCase.want {
+			t.Errorf("parseExpectHash(%q) = %016x, want %016x", testCase.text, hash, testCase.want)
+		}
+	}
+
+	rejected := []string{"nothex", "0x", "-1", "3f9a2b1c4d5e6f70f", "3f9a 2b1c", " 3f9a"}
+	for _, text := range rejected {
+		if _, present, err := parseExpectHash(text); err == nil {
+			t.Errorf("parseExpectHash(%q) accepted the value (present %v); it is not a state hash",
+				text, present)
+		}
 	}
 }
 
