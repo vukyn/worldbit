@@ -1,0 +1,21 @@
+# Git ignore
+.env
+bin/
+todo
+
+# Node
+node_modules/
+
+# Python
+venv/
+
+# MacOS
+.DS_Store
+
+# Knowledge graph cache (local artefact, never committed)
+.code-review-graph/
+
+# Experiment outputs (disposable; testdata/golden_hashes.csv is NOT ignored)
+runs*.csv
+out/
+runs*.config.json
