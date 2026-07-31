@@ -16,6 +16,7 @@ import (
 
 	"github.com/vukyn/worldbit/internal/config"
 	"github.com/vukyn/worldbit/internal/sim"
+	"github.com/vukyn/worldbit/internal/stats"
 )
 
 // version is written into every output record, so a "same seed, different
@@ -157,9 +158,9 @@ func resolveConfig(c *cli.Context) (sim.Config, error) {
 	return cfg, nil
 }
 
-// runHeadless is the batch entry point. The outcome classifier and the
-// CSV/JSON writers arrive in later phases; for now it runs a single world and
-// reports its canonical hash, which is what the determinism harness is for.
+// runHeadless is the batch entry point. The worker pool and the CSV/JSON
+// writers arrive with the batch runner; for now it runs a single world,
+// classifies its outcome and reports its canonical hash.
 func runHeadless(c *cli.Context, cfg sim.Config) error {
 	seed := c.Uint64("seed")
 	hashEvery := int32(c.Int("hash-every"))
@@ -167,10 +168,12 @@ func runHeadless(c *cli.Context, cfg sim.Config) error {
 	if c.IsSet("runs") || c.IsSet("out") || c.IsSet("workers") {
 		fmt.Fprintln(os.Stderr,
 			"worldbit: --runs/--out/--workers are accepted but not wired yet; the batch runner "+
-				"lands with the outcome classifier. Running a single seed.")
+				"lands in the next phase. Running a single seed.")
 	}
 
 	world := sim.NewWorld(seed, cfg)
+	classifier := stats.NewClassifier(classifierParams(cfg))
+
 	fmt.Printf("seed=%d ticks=%d config_hash=%016x version=%s\n", seed, cfg.MaxTick, cfg.Hash(), version)
 	if err := world.VerifyError(); err != nil {
 		return fmt.Errorf("invariant broken at tick %d: %w", world.Tick, err)
@@ -178,6 +181,14 @@ func runHeadless(c *cli.Context, cfg sim.Config) error {
 
 	for world.Tick < cfg.MaxTick {
 		sim.Step(world)
+
+		// One sample per completed tick, so the classifier's tick numbering is
+		// the simulation's. A terminal outcome makes later samples no-ops; the
+		// run still goes the distance here because --verify and --hash-every
+		// are diagnostics that want the whole trajectory. Stopping early on a
+		// terminal outcome is the batch runner's job, where the wall time
+		// saved is the point.
+		classifier.Observe(int(world.Population()))
 
 		// Reported on the tick it happens: past the first violation every
 		// later tick is built on known-bad state and only buries the cause.
@@ -189,9 +200,29 @@ func runHeadless(c *cli.Context, cfg sim.Config) error {
 		}
 	}
 
-	fmt.Printf("tick=%d pop=%d state_hash=%016x\n", world.Tick, world.Population(), sim.Hash(world))
+	outcome := classifier.Finish()
+	fmt.Printf("tick=%d pop=%d outcome=%s peak_pop=%d peak_year=%d extinct_year=%d state_hash=%016x\n",
+		world.Tick, world.Population(), outcome,
+		classifier.PeakPopulation(), classifier.PeakYear(), classifier.ExtinctYear(),
+		sim.Hash(world))
 	if cfg.Verify {
 		fmt.Println("invariants held on every tick")
 	}
 	return nil
+}
+
+// classifierParams maps the simulation config onto the classifier's
+// thresholds. Only the two grid-derived numbers travel: internal/stats never
+// imports internal/sim, so that the classifier stays independently testable
+// against hand-built series and the simulation stays free of statistics.
+//
+// The window length is deliberately NOT derived from TicksPerYear: an
+// externally-configured TicksPerYear could then push the window past the size
+// the integer accumulators are proven safe for, turning a config value into a
+// panic.
+func classifierParams(cfg sim.Config) stats.ClassifierConfig {
+	params := stats.DefaultClassifierConfig()
+	params.TicksPerYear = int(cfg.TicksPerYear)
+	params.OverrunPopulation = stats.OverrunPopulationFor(int(cfg.Width) * int(cfg.Height))
+	return params
 }
