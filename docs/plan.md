@@ -86,17 +86,20 @@ internal/sim/                    # PURE. stdlib only.
   determinism_lint_test.go       # AST guard
   determinism_test.go
   invariants_test.go
+internal/config/                 # file + flag + sweep resolution; the only package that reads os
+  config.go                      # Resolve, ApplyOverrides, SetField, Marshal, Dump
+  sweep.go                       # Sweep grid: LoadSweep, Expand, per-cell Validate
 internal/stats/
   window.go                      # integer accumulators over a 1200-tick window
   intcmp.go                      # 128-bit a*b vs c*d via math/bits.Mul64
-  classify.go                    # Outcome enum + classifier state machine
+  classify.go                    # Outcome enum + classifier state machine + burn-in
   recorder.go                    # pop history (sparkline) + peak tracking
-  classify_test.go
+  classify_test.go  burnin_test.go
 internal/runner/
-  runner.go                      # worker pool over seeds; one World per worker
-  record.go
-  output.go                      # CSV + JSON; results sorted by seed before emit
-  runner_test.go
+  runner.go                      # worker pool over runs; one World per worker; early stop
+  record.go                      # Record + Axis: the CSV/JSON row
+  output.go                      # CSV + JSON + per-cell aggregate; sorted before emit
+  runner_test.go  output_test.go
 internal/gui/                    # //go:build !nogui on every file
   game.go  render.go  sparkline.go  hud.go  input.go  snapshot.go
 testdata/
@@ -106,14 +109,17 @@ testdata/
 **Strict one-way dependency** (state in CLAUDE.md, enforce in review):
 
 ```
-main -> {gui, runner}
-gui  -> {sim, stats}
+main   -> {config, gui, runner}
+gui    -> {sim, stats}
 runner -> {sim, stats}
-stats -> {}   (stdlib only, no sim import)
-sim   -> {}   (stdlib only)
+config -> {sim}
+stats  -> {}   (stdlib only, no sim import)
+sim    -> {}   (stdlib only)
 ```
 
 `sim` must never import `stats`, `runner`, `gui`, `fmt`, `os`, `time`, `log`, `sync`, `math/rand`, `crypto/rand`, `math`.
+
+`runner` must never import `config`, even though the sweep is run by the runner: sweep files are configuration, so parsing and expanding them belongs on the config side, and `main` maps `config.SweepCell` onto `runner.Cell`. That mapping is a dozen lines and is the price of keeping `runner -> {sim, stats}` true.
 
 `internal/` rather than sgo-style `pkg/`: nothing here is meant to be imported by another repo, and `internal/` makes that a compiler guarantee. Trivially reversible.
 
@@ -147,6 +153,13 @@ type Config struct {
     InitAgentEnergy int16  // 50
     InitAgeSpread   int32  // 240 — initial ages uniform in [0, InitAgeSpread)
     SearchRadius    int32  // 12  — Chebyshev cap on nearest-food search
+
+    // Classification, not simulation: the sim never reads it and it cannot
+    // move a state hash. It lives here so it travels in config_hash and so a
+    // sweep can address it by field name. 0 disables burn-in. See the
+    // classifier section.
+    BurnInWindows   int32  // 1
+
     Verify          bool
 }
 
@@ -209,7 +222,7 @@ Fail loudly at startup with the offending field named, before a single tick runs
 
 **Format: JSON**, via stdlib `encoding/json`. No new dependency, and it round-trips exactly with `--dump-config`. Cost: no comments in the file, mitigated by descriptive field names and by `--dump-config` being self-generating. TOML (`BurntSushi/toml`) is the alternative if hand-written comments turn out to matter; it is one small dependency and a drop-in change.
 
-**Downstream benefit (not built now, but unblocked):** an explicit config makes *parameter* sweeps possible, not just seed sweeps — e.g. a grid over `InitFoodPerCell × ReproEnergyCost`, 100 seeds per cell, to map which parameter region yields STABLE. A natural P7; the design must not preclude it, and this one doesn't.
+**Downstream benefit — built, and moved up into P4.** An explicit config makes *parameter* sweeps possible, not just seed sweeps: a grid over `InitFoodPerCell × ReproEnergyCost`, N seeds per cell, mapping which parameter region yields STABLE. Originally sketched as a natural P7, this was pulled forward because seed variation alone at the ratified defaults produces near-identical runs and leaves four of the six outcomes unreachable — the sweep is what turns the harness from a determinism demonstration into an experiment. See "Parameter sweeps" under P4.
 
 **Tests:** `TestConfigRoundTrip` (dump → load → identical `Hash()`); `TestPartialConfigKeepsDefaults` (asserts every unmentioned field is still exactly its default, guarding against a future over-tightening into "every key required"); `TestConfigRejectsUnknownField` (a bogus key errors out naming the field); `TestValidateRejects` (table-driven over every rule above); `TestConfigHashChangesWithEveryField` (reflectively flip each field, assert the hash moves — catches a field added to `Config` but forgotten in `Hash()`, which would silently make two different configs look identical).
 
@@ -293,7 +306,7 @@ Multiple draws in one tick pull successively from the returned `Rand` — still 
 
 **6. No mutation during iteration.** Implemented as **phase separation with an intent buffer** — semantically identical to "read state N, write state N+1" but avoids a 64 KB memcpy per tick (768 MB per 12 000-tick run). Invariant: *no phase both reads and writes the same layer*. The decide phase receives a `WorldView` exposing only value-returning accessors with no mutating methods, so "decide cannot write" is close to compile-enforced. A literal double buffer is a one-line change to `Step` if preferred; not recommended, same guarantee for 768 MB more copying.
 
-**7. Single-threaded sim.** AST test also fails on `*ast.GoStmt`, `*ast.SelectStmt`, and any channel type inside `internal/sim`. Parallelism exists only in `internal/runner`, **between** runs: each worker owns a `World` it built itself and shares nothing but the results channel. `TestRunnerParallelMatchesSerial` proves it.
+**7. Single-threaded sim.** AST test also fails on `*ast.GoStmt`, `*ast.SelectStmt`, and any channel type inside `internal/sim`. Parallelism exists only in `internal/runner`, **between** runs: each worker owns a `World` it built itself and shares no simulation state at all. As built, there is no results channel either — jobs are enumerated up front and each worker writes into its own slot of a preallocated slice, so there is nothing to reorder and no mutex to contend on; the only shared objects are an atomic job cursor and an atomic stop flag. `TestRunnerParallelMatchesSerial` proves it, and `go test -race ./...` is part of the gate.
 
 **8. Determinism is a test, not a hope.** Three layers, all written in P1 before any agent exists:
 - `TestSameSeedSameHash` — same seed twice, step both to `MaxTick`, compare `Hash(w)` every 100 ticks; fail on the first divergent tick and report it.
@@ -424,6 +437,8 @@ per tick:
     if pop > 40% of cells (6553) -> OVERRUN, terminal
     track peak_pop / peak_year
 on each 1200-tick boundary:
+    windowIndex++                                  # counts CLOSED windows, burn-in included
+    if windowIndex <= BurnInWindows -> skip EVERY predicate below; next window
     evaluate cv and slope predicates over the just-closed window
     if stable-predicate && pop >= 20 -> stableStreak++ ; if streak == 3 -> STABLE, terminal
     else                             -> stableStreak = 0
@@ -435,13 +450,33 @@ at MAX_TICK:
     else                                  -> TIMEOUT
 ```
 
-**Record** — one row per seed, fixed CSV column order, LF endings, hash as `%016x`:
+**Burn-in (`BurnInWindows`, default 1) — ratified after P3, and it changes what OSCILLATING means.**
+
+Window 1 of every run contains the startup transient: the founding population is fed by the initial pantry, booms far past the carrying capacity, and crashes back. That window can never satisfy the stable predicate, and its coefficient of variation latches `maxCV` above 0.25 for the rest of the run. OSCILLATING is the first branch of the end-of-run fallback, so **every run that failed to string together three stable windows was labelled OSCILLATING** — the label meant "did not reach STABLE in time", not "genuinely oscillating", and it would mislabel whole regions of a parameter sweep.
+
+The rules:
+
+- Windows with index < `BurnInWindows` **are still accumulated and still advance the boundary**, so window numbering and the tick timeline are unaffected.
+- They are excluded from **every** predicate — the stable streak, `maxCV`, and the declining-slope fallback alike. A burn-in that some predicates respected and others ignored would be worse than none, because the verdict would answer no single question. (Suppressing only `maxCV` while still letting the crash reset the streak, or the reverse, each reintroduce half the original bug.)
+- The **per-tick** EXTINCT and OVERRUN checks still fire during burn-in. Burn-in excludes window predicates, not the run's terminal conditions: a run that dies inside its burn-in must not be reported as an uneventful timeout.
+- `BurnInWindows = 0` reproduces the pre-burn-in behaviour **exactly**, which is what makes the change provably opt-out; `TestBurnInZeroIsExactlyTheOldBehaviour` pins that with hard-coded expectations rather than derived ones.
+- A burn-in longer than the whole run is legal and must not panic: no predicate is ever evaluated and the run resolves as TIMEOUT.
+
+`BurnInWindows` is a **classification** parameter, not a simulation one — it cannot move a single state hash. It nevertheless lives in `sim.Config` and therefore in `config_hash`, for two reasons: two runs classified with different burn-ins are not comparable even when their trajectories are bit-identical, and a sweep addresses its axes by `Config` field name, so a knob that is not a `Config` field cannot be swept. `MaxTick` is in `Config` on the same footing.
+
+Measured effect on the eight golden seeds: seven were STABLE before and after (STABLE is terminal and is reached before the fallback ever runs, so burn-in correctly neither helps nor hurts them), and seed 5 moved OSCILLATING → DECLINING with its `state_hash` unchanged.
+
+**Record** — one row per run, fixed CSV column order, LF endings, hash as `%016x`:
 
 ```
 seed, outcome, peak_pop, peak_year, extinct_year, final_pop, final_tick, state_hash, config_hash, version, wall_ms
 ```
 
-`wall_ms` is the one non-deterministic column (capacity planning); exclude it from any result-diff tool. Results collected into a slice and **sorted by seed before writing**, so the file is byte-identical across worker counts.
+Under `--sweep`, one column per swept axis is appended **after** those eleven, so a row is self-describing and a tool that knows the canonical schema keeps working. `config_hash` is always the hash of the config *that row* used, which in a sweep is the cell's, not the base's.
+
+**`wall_ms` is the one non-deterministic column** (it exists for capacity planning). Every consumer must exclude it: a result-diff tool must ignore it, and any byte-comparison of two result files must blank it first. **Two records with different `config_hash` are not comparable at all**, and a diff tool must refuse rather than try.
+
+Results are collected into a slice and **sorted by cell index, then by seed, before writing**. Two runs of the same batch at different worker counts therefore produce files that are **identical apart from `wall_ms`** — they cannot be byte-identical while a wall-clock column is in the schema, and an earlier draft of this plan wrongly claimed they were. `TestRunnerParallelMatchesSerial` compares `--workers 1` against `--workers 8` with `wall_ms` blanked, in both output formats.
 
 ---
 
@@ -461,6 +496,9 @@ worldbit [flags]
 --config, -c   string   JSON config file; absent fields keep their defaults (default none)
 --set          k=v      single-parameter override, repeatable:
                         --set InitFoodPerCell=3 --set FoodMax=8
+--sweep        string   JSON parameter-grid file; runs every cell of the grid  (default none)
+                        batch only; the file's seeds/seed_start govern the
+                        seed range, so --seed/--runs are ignored under it
 --dump-config  string   write the resolved config as JSON and exit
 --verify                enable sim invariant assertions (slow)              (default false)
 --hash-every   int      print the state hash every N ticks (0 = off)        (default 0)
@@ -543,12 +581,56 @@ Determinism harness precedes gameplay throughout. Each phase ends green on `go t
 3. `TestClassifyKnownSeries` — hand-built series for each of the six outcomes.
 4. `TestClassifierPredicatesMatchRationalReference` — integer predicates vs `big.Rat`, exact equality.
 
-### P4 — Batch runner (core deliverable complete at the end of this phase)
-1. `record.go`, `runner.go` (worker pool, one `World` per worker, no pooling, no shared state), `output.go` (CSV + JSON, sorted by seed, `config_hash` + `version` in every row and in the JSON header).
-2. `TestRunnerParallelMatchesSerial` — `--workers 1` and `--workers 8` produce byte-identical output files.
+### P4 — Batch runner and parameter sweeps (core deliverable complete at the end of this phase)
+1. `record.go`, `runner.go` (worker pool, one `World` per worker, no pooling, no shared state), `output.go` (CSV + JSON, sorted by cell then seed, `config_hash` + `version` in every row and in the JSON header).
+2. `TestRunnerParallelMatchesSerial` — `--workers 1` and `--workers 8` produce output files identical apart from `wall_ms`.
 3. `TestOutputSortedBySeed`.
 4. Wire `--headless`, `--runs`, `--ticks`, `--out`, `--workers`.
 5. Smoke: `--headless --runs 1000 --out runs.csv`, eyeball the outcome distribution. **If everything is EXTINCT or everything is OVERRUN, stop and revisit `InitFoodPerCell` / `ReproEnergyCost` with the user rather than tuning silently** — the parameter set is theirs.
+6. Classifier burn-in (`BurnInWindows`, default 1) — see the classifier section. Do this **first**: it changes what the phase's own output means.
+7. Parameter sweeps (`--sweep`), below.
+
+**Early stop on a terminal outcome.** EXTINCT and OVERRUN end the run where they happen and the actual tick goes into `final_tick`. An overrun run costs roughly 13× a normal one per tick, which across a sweep is the difference between minutes and hours; an extinct run finishes in a few milliseconds instead of half a second.
+
+STABLE is terminal for the *classifier* but deliberately does **not** stop the simulation. `final_pop`, `final_tick` and `state_hash` describe the world where the simulation stopped, and cutting stable runs short at their third stable boundary would make those three columns describe a different point in time for stable runs than for every other kind — and would break replay verification, which re-simulates to `final_tick` and compares hashes. `TestEarlyStopDoesNotChangeTheOutcome` pins that the optimisation is invisible in the verdict, and fails loudly if the configurations it uses stop reaching a terminal outcome (an early-stop test that never exercises the early stop proves nothing).
+
+#### Parameter sweeps
+
+`--sweep <file.json>` describes a grid:
+
+```json
+{
+  "seeds": 20,
+  "seed_start": 1,
+  "axes": {
+    "InitFoodPerCell": [1, 3, 5],
+    "ReproEnergyCost": [30, 40, 50]
+  }
+}
+```
+
+- **Axis keys are `Config` field names — the same PascalCase identifiers `--set` uses**, resolved through the *same* exported `config.SetField`. There must not be a second name-matching path: two spellings that drift apart would break the promise that a sweep row is reproducible from its own command line. `TestSweepUsesTheSetFieldResolution` compares a cell's config against the equivalent `--set` and requires identical hashes.
+- **Unknown axis keys are a hard error**, consistent with `--config` and `--set`, and so are axis values that cannot be applied to the field they name (`FoodMax: [99999]`). Both are reported once at load, before anything runs, because they would fail identically in every cell. A silently ignored axis would produce a grid of *identical* cells that looks entirely plausible.
+- Axis order is **sorted by key name**, not the order the JSON object listed them in: the axes arrive in a map, Go map iteration is randomised, and cell numbering, column order and the aggregate all depend on that order being fixed.
+- Cells are the Cartesian product, last axis varying fastest. Each runs `seeds` runs (`seed_start … seed_start+seeds-1`); total runs = cells × seeds.
+- `seed_start` decodes through a pointer so an absent key defaults to 1 while an explicit `0` stays `0` — seed 0 is a legal seed.
+- The base config resolves as usual (default → `--config` → `--set`); each cell layers its axis fields on top, then **`Validate()` runs per cell**. An invalid cell is reported by name and **skipped, not fatal** — a grid deliberately spans territory the parameters cannot all reach, and losing the whole sweep to one impossible corner (say `ReproEnergyCost` above `ReproEnergyMin`) would make wide grids unusable. The count of skipped cells is logged. A sweep in which *every* cell is invalid is an error, not an empty results file. Surviving cells keep their index in the full product, so a cell's identity does not shift when a neighbour is dropped.
+- **The total run count and a wall-time estimate are printed before the first tick.** This is the "no silent caps" rule: there is no cap, so knowing what you launched is the only protection against accidentally launching a six-hour sweep.
+- `config_hash` per row is that row's own resolved config, never the base.
+
+Two outputs, both named by appending to `--out` (appending rather than substituting, so two outputs differing only by extension cannot collide on one sidecar):
+
+| File | Contents |
+|---|---|
+| `<out>` | the per-run CSV/JSON as usual, plus one column per swept axis |
+| `<out>.config.json` | the resolved **base** config, written for every batch, sweep or not |
+| `<out>.cells.csv` | one row per cell: axis values, the count of each of the six outcomes, mean/median peak and final population, and the cell's `config_hash` |
+
+The aggregate is what actually answers "which parameter region is interesting"; the per-run file says what each individual seed did. Means are summed in integers and divided exactly once, so the floating-point result cannot depend on the order runs completed in, and are formatted to one decimal place so the file stays byte-stable.
+
+**Placement:** sweep parsing and expansion live in `internal/config`, not `internal/runner`, so that the one-way dependency `runner -> {sim, stats}` holds. `main` maps `config.SweepCell` onto `runner.Cell`.
+
+**Tests:** sweep output identical across worker counts (per-run file *and* aggregate); a 2×2 grid produces exactly cells×seeds rows; an unknown axis key errors and writes no output file; an invalid cell is skipped while the rest still run; every-cell-invalid is an error; cell aggregation counts checked against hand-built records.
 
 ### P5 — GUI
 1. `frame.go` + `RenderInto` in `sim`; `TestGUINeverMutates`.
@@ -566,6 +648,37 @@ Determinism harness precedes gameplay throughout. Each phase ends green on `go t
 
 ---
 
+## Experimental findings (P4, 2026-07-31)
+
+The first real results the harness has produced. Recorded here because they are what P5 and P6 will be reasoned from, and because two of them are corrections to assumptions in this plan.
+
+Method: a 45-cell sweep over `InitFoodPerCell` [1,3,5] × `ReproEnergyCost` [30,40,50] × `FoodRegrowTicks` [25,100,400,1600,6400], 20 seeds per cell (900 runs, 37 s), plus a 12-cell `BurnPerTick` × `FoodRegrowTicks` grid and a 6-cell probe of the near-overrun band.
+
+**1. `FoodRegrowTicks` dominates; it is the carrying-capacity knob.** Capacity is `cells / FoodRegrowTicks × EnergyPerFood / BurnPerTick`, and the outcome follows it almost deterministically:
+
+| `FoodRegrowTicks` | capacity | outcome over 180 runs |
+|---|---|---|
+| 25 | ~6550 | OVERRUN, every seed |
+| 100 | ~1640 | STABLE, every seed |
+| 400 | ~410 | STABLE/TIMEOUT mix, a few DECLINING |
+| 1600 | ~102 | TIMEOUT, a few DECLINING |
+| 6400 | ~26 | OSCILLATING, every seed |
+
+**2. `InitFoodPerCell` and `ReproEnergyCost` only move the opening boom height, not the outcome.** Across the `InitFoodPerCell` axis at a fixed `FoodRegrowTicks`, mean peak population moves by 4–5× (677 → 3074 at regrow 6400) while the outcome distribution does not move at all. This *revises risk item 1*, which called `InitFoodPerCell` "the highest-leverage unknown" on the reasoning that the first boom decides whether runs classify OVERRUN. The boom does scale as predicted; it simply does not decide the classification, because OVERRUN at the default grid is reached only where the *sustained* capacity is near the threshold. `FoodRegrowTicks` — which the plan never listed as an open question — is the parameter that deserved that billing.
+
+**3. EXTINCT needs a metabolic squeeze, not starvation.** Slowing regrowth does not extinguish a population: even `FoodRegrowTicks=12000` (capacity ~14) leaves a surviving remnant in every seed. Raising `BurnPerTick` does: 5 extinguishes every seed at regrow ≥ 1600, and 2–3 gives a 55–90 % extinction rate. The reason is that the search-and-eat loop keeps a small population alive on a trickle indefinitely, so the way to kill it is to raise the per-agent floor cost rather than lower the supply.
+
+**4. Large-amplitude sustained oscillation appears not to exist anywhere in the space probed — and this is a finding about the CLASSIFIER, not only the ecology.** Every OSCILLATING cell sits at mean final population 9–20 against peaks of 600–3000. That is a starving remnant of 10–40 agents whose small-number noise trivially clears the coefficient-of-variation line, because CV is **scale-free**: a population wandering between 10 and 40 has a far higher CV than one wandering between 700 and 900, though only the latter is what "oscillating ecology" is meant to describe. Two checks confirm the reading:
+
+- Walking `BurnInWindows` from 0 to 9 on such a cell shows high variation persisting through ~7 of 10 windows and then decaying into DECLINING/TIMEOUT — a long slow collapse, not a limit cycle.
+- The near-overrun band where genuine overshoot cycles would live (`FoodRegrowTicks` 30/40/50/60/75/90, defaults otherwise, 20 seeds each) produced **not one** OSCILLATING run: 20/20 OVERRUN at 30, an 11/9 STABLE/OVERRUN split at 40, and STABLE from 50 up (119 STABLE and a single TIMEOUT at 75 across the four slowest cells). No oscillation at large population anywhere.
+
+**A future reader must not trust the OSCILLATING label as evidence of a cycling ecology.** If that distinction matters later, the fix is a floor on the CV predicate (an absolute amplitude alongside the relative one) or a minimum population for the high-variation flag, mirroring the `MinStablePopulation` floor the stable predicate already has — not a parameter change. This is a design question for the user, not a bug.
+
+**5. The ratified defaults sit in a deliberately quiet region.** At `FoodRegrowTicks=200`, between the all-STABLE and mixed bands, a 1000-seed batch is 966 STABLE / 33 TIMEOUT / 1 DECLINING, with EXTINCT, OVERRUN and OSCILLATING unreachable and the peak at year 6 in all eight golden seeds. Moving `FoodRegrowTicks` one notch changes the distribution more than 1000 seeds do. **The defaults were not retuned** — they are the user's, and this map is the evidence for that decision rather than a licence to make it. Note for anyone exercising the classifier: use a sweep, not a seed batch. `FoodRegrowTicks` 300–500 is where STABLE, TIMEOUT and DECLINING coexist inside one cell.
+
+---
+
 ## Migrations
 
 **None.** No database of any kind. The only persisted artefacts are CSV/JSON outputs — disposable experiment results, not state. `testdata/golden_hashes.csv` is the one committed data file; its "migration" procedure is `make golden` plus a commit message explaining which behavioural change justified it.
@@ -579,9 +692,20 @@ Determinism harness precedes gameplay throughout. Each phase ends green on `go t
 - **Determinism (P1, first):** `TestDeterminismLint`, `TestSameSeedSameHash`, `TestGoldenHashes`, `TestSubstreamIndependence`.
 - **Sim invariants (P2):** ascending IDs, energy/food/age bounds, block index equals rebuild, energy conservation per tick, regrowth stride coverage, `TestDeepRunNoOverflow` at 120 000 ticks.
 - **Numerics (P3):** integer predicates vs `big.Rat`; classifier vs hand-built series for all six outcomes; `Rand.Intn` bucket uniformity.
-- **Runner (P4):** parallel output byte-identical to serial; sorted by seed; `config_hash` present and stable.
+- **Runner (P4):** parallel output identical to serial apart from `wall_ms` (in both CSV and JSON); sorted by cell then seed; early stop does not change the verdict; `config_hash` present, per-row, and stable.
+- **Sweeps (P4):** grid expansion and axis ordering; unknown axis key and unusable axis value rejected at load; invalid cell skipped while the rest run; every-cell-invalid is an error; cell aggregation checked against hand-built records; sweep output identical across worker counts for both the per-run file and the aggregate.
+- **Burn-in (P4):** a wild opening followed by a flat tail classifies STABLE; `BurnInWindows=0` reproduces the old behaviour with hard-coded expectations; a burn-in longer than the run yields TIMEOUT without panicking; each of the three predicates is separately shown to respect it; EXTINCT and OVERRUN still fire inside burn-in.
 - **GUI (P5):** `TestGUINeverMutates`. Rest verified manually.
 - **Performance guards:** `BenchmarkStep`, `BenchmarkRun12000`, documented target ≈1 s per 12 000-tick run. Watch in review, not a hard failure.
+
+**Measured at P4** (default parameters, 12 000 ticks, arm64):
+
+| Condition | Cost per run |
+|---|---|
+| One run on its own (`--workers 1`) | **~350 ms** |
+| Effective, under a pool saturating 8 cores | **~553 ms** |
+
+The ≈1 s target is met with room to spare, but the **parallel scaling caveat is new information**: 1 000 runs take 69 s wall for 429 s of CPU on 8 workers, i.e. roughly 1.6× the solo cost per run rather than the 1.0× a linear-scaling job would show. The simulation is memory-bound over the 16 384-cell grid, so workers contend for bandwidth. Plan sweep budgets on the saturated figure, not the solo one — which is what `runner.EstimatedDuration` does, deliberately over-estimating a `--workers 1` batch because that is the harmless direction to be wrong in. Early stop then makes the estimate conservative in practice: a 900-run sweep estimated at 62 s finished in 37 s because its EXTINCT and OVERRUN cells stopped early.
 
 **Manual:**
 1. `make headless` → 100 seeds, inspect the outcome mix.
@@ -596,7 +720,7 @@ Determinism harness precedes gameplay throughout. Each phase ends green on `go t
 
 **Unspecified parameters that materially change the outcome distribution** — defaults proposed so the coder isn't blocked, but each deserves a decision:
 
-1. **`InitFoodPerCell` — highest-leverage unknown.** The first boom is fed almost entirely by the starting pantry, so this, not the regrowth rate, decides whether early runs classify OVERRUN. At 5 (full board), standing 81 920 food ≈ 819 200 energy supports an ~8 000-agent overshoot — above the OVERRUN threshold of 6 553, meaning OVERRUN would largely measure the initial condition. At 1 the ceiling is ~1 600. **Proposed: 1.**
+1. **`InitFoodPerCell` — highest-leverage unknown.** *(Superseded by measurement at P4 — see "Experimental findings", item 2: the boom scales as predicted but does not decide the classification, and `FoodRegrowTicks` turned out to be the parameter that deserved this billing. Kept as written for the record.)* The first boom is fed almost entirely by the starting pantry, so this, not the regrowth rate, decides whether early runs classify OVERRUN. At 5 (full board), standing 81 920 food ≈ 819 200 energy supports an ~8 000-agent overshoot — above the OVERRUN threshold of 6 553, meaning OVERRUN would largely measure the initial condition. At 1 the ceiling is ~1 600. **Proposed: 1.**
 2. **`FoodMax` — not specified at all.** Uncapped, a 120 000-tick deep run accumulates up to 600 food (6 000 energy) in one cell, turning cells into infinite larders and making famine impossible. **Proposed: 5.** Accepted consequence: once the board saturates, regrowth on full cells is wasted, so effective production falls below 82 food/tick near full recovery — sensible, but it bounds recovery speed.
 3. **Reproduction energetics.** **Proposed:** `ReproEnergyMin 60`, `ReproEnergyCost 40`, `ChildEnergy 30` (10 lost as overhead, a mild damper on runaway growth). Conservative variant: cost 30 / child 30, no loss.
 4. **Hunger threshold. Proposed: 70.** Implies eating is skipped when it would waste more than one food-unit of energy; the cap makes some waste unavoidable and intended.
@@ -609,6 +733,8 @@ Determinism harness precedes gameplay throughout. Each phase ends green on `go t
 
 9. **Nearest-food search bounded at radius 12, not global.** Literal "nearest food on the board" is ~13 M cell reads/tick — misses the ~1 s/run target by two or three orders of magnitude. Behavioural change: an agent with no food within 12 cells wanders rather than beelining across the map. If unbounded nearest is semantically required, a multi-level food quadtree gives it — more code, same determinism properties.
 10. **OVERRUN terminal**, like EXTINCT. The brief only marks EXTINCT stop-immediately, but a run reaching 6 553 agents costs ~13× a normal run and dominates batch wall-time while telling you nothing new.
+11a. **Burn-in on the classifier's windows** (`BurnInWindows`, default 1), ratified after P3 and built at the start of P4. Without it OSCILLATING means "did not reach STABLE in time"; see the classifier section for the rule and "Experimental findings" item 4 for what OSCILLATING still does *not* mean.
+
 11. **Non-overlapping 1200-tick windows** rather than a per-tick sliding window. Only reading consistent with "3 consecutive windows (30 y)"; collapses the classifier to five O(1) accumulators, no ring buffer. A true sliding window with a 120-tick stride is a small change but needs int128 comparisons on every evaluation and a restated "3 consecutive" rule.
 12. **DECLINING threshold. Proposed:** slope·1200/mean < −0.10 (losing >10 % of window mean per window).
 13. **Phase-separated single buffer instead of a literal state copy.** Same guarantee, zero copy; a literal double buffer costs ~768 MB of memcpy per run for no added safety.
@@ -634,9 +760,10 @@ Tone modelled on `speedtest/CLAUDE.md` and `sgo/CLAUDE.md`, determinism contract
 5. **Tick phase order** — the six phases, plus: changing the order, the tiebreak scheme, or the RNG mixing changes every hash and requires golden regeneration with justification.
 6. **Golden hashes** — how to regenerate, and that regenerating is a deliberate act with a commit-message justification, never a reflex when a test goes red.
 7. **Parameters** — `internal/sim/config.go` is the single source of truth; never hardcode a constant inline (mirrors sgo's rule about `pkg/analyzer/config.go`). Include the carrying-capacity arithmetic (16 384 ÷ 200 × 10 ÷ 1 ≈ 820) so a future reader can sanity-check a parameter change, plus "population above ~5 000 means a bug".
-7b. **External config** — the resolution order (default → `--config` file → `--set`); that `config_hash` is computed on the resolved config; that `--dump-config` is how you record an experiment; and the hard rule that **no simulation parameter may ever come from an environment variable**, with the reason (ambient, machine-local, invisibly divergent). Adding a field to `Config` means adding it to `Hash()`, `Validate()`, and the JSON tags — `TestConfigHashChangesWithEveryField` enforces the first.
-8. **CLI surface and commands** — flag table, `make` targets, the `nogui` build tag.
-9. **Output schema** — CSV columns, the meaning of `config_hash`, and that records with differing `config_hash` are not comparable.
+7b. **External config** — the resolution order (default → `--config` file → `--set`); that `config_hash` is computed on the resolved config; that `--dump-config` is how you record an experiment; and the hard rule that **no simulation parameter may ever come from an environment variable**, with the reason (ambient, machine-local, invisibly divergent). Adding a field to `Config` means adding it to `Hash()`, `Validate()`, and the JSON tags — `TestConfigHashChangesWithEveryField` enforces the first. Also: parameter names resolve through exactly one function, `config.SetField`, shared by `--set` and sweep axis keys — never add a second name-matching path.
+7c. **Classifier burn-in** — `BurnInWindows` (default 1) excludes leading windows from every window predicate but not from the per-tick terminal checks; 0 reproduces the pre-burn-in behaviour; it is a classification parameter that lives in `Config` so it travels in `config_hash` and can be swept. And the caveat from "Experimental findings" item 4: **OSCILLATING currently means high relative variation, which a starving remnant of a dozen agents satisfies trivially** — do not read it as a cycling ecology.
+8. **CLI surface and commands** — flag table (including `--sweep`), `make` targets, the `nogui` build tag.
+9. **Output schema** — CSV columns; that `wall_ms` is the one non-deterministic column and every consumer must exclude it (two runs at different worker counts differ in that column and nothing else); the sweep's appended axis columns and the two extra files (`<out>.config.json`, `<out>.cells.csv`); the meaning of `config_hash`, that it is per-row and per-cell, and that records with differing `config_hash` are not comparable.
 10. **Conventions** — no maps; integer only; `sort.SliceStable` by ID; hash canonical state only, never derived caches (and why); `.code-review-graph/` gitignored; `.env` carries only `PRJ`/`VERSION`, never simulation parameters.
 
 ## Line for the platform-root `CLAUDE.md` repo list

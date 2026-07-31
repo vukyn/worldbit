@@ -87,18 +87,21 @@ func TestClassifyKnownSeries(t *testing.T) {
 			},
 		},
 		{
-			// Flat and unvarying: three consecutive windows resolve it, so the
-			// run ends at tick 3600 rather than at the tick limit.
+			// Flat and unvarying: three consecutive EVALUATED windows resolve
+			// it. The default burn-in excludes the first window, so the third
+			// evaluated window is the fourth closed one and the run ends at
+			// tick 4800 rather than at the tick limit.
 			name:    "stable",
 			want:    OutcomeStable,
 			samples: constantSeries(800, runTicks),
 			check: func(t *testing.T, classifier *Classifier) {
-				if classifier.Tick() != 3*params.WindowTicks {
-					t.Errorf("resolved at tick %d, want %d — STABLE is terminal at the third window",
-						classifier.Tick(), 3*params.WindowTicks)
+				wantWindows := params.BurnInWindows + 3
+				if classifier.Tick() != wantWindows*params.WindowTicks {
+					t.Errorf("resolved at tick %d, want %d — STABLE is terminal at the third window past burn-in",
+						classifier.Tick(), wantWindows*params.WindowTicks)
 				}
-				if classifier.WindowsEvaluated() != 3 {
-					t.Errorf("evaluated %d windows, want 3", classifier.WindowsEvaluated())
+				if classifier.WindowsClosed() != wantWindows {
+					t.Errorf("closed %d windows, want %d", classifier.WindowsClosed(), wantWindows)
 				}
 				if classifier.ExtinctYear() != -1 {
 					t.Errorf("extinct year %d, want -1 for a run that never died", classifier.ExtinctYear())
@@ -122,9 +125,9 @@ func TestClassifyKnownSeries(t *testing.T) {
 					t.Errorf("ran %d ticks, want the full %d — oscillation is only resolved at the limit",
 						classifier.Tick(), runTicks)
 				}
-				if classifier.WindowsEvaluated() != runTicks/params.WindowTicks {
+				if classifier.WindowsClosed() != runTicks/params.WindowTicks {
 					t.Errorf("evaluated %d windows, want %d",
-						classifier.WindowsEvaluated(), runTicks/params.WindowTicks)
+						classifier.WindowsClosed(), runTicks/params.WindowTicks)
 				}
 			},
 		},
@@ -193,7 +196,7 @@ func TestClassifyKnownSeries(t *testing.T) {
 			if got := classifier.Outcome(); got != testCase.want {
 				t.Fatalf("outcome %s, want %s (tick %d, pop %d, peak %d, windows %d)",
 					got, testCase.want, classifier.Tick(), classifier.FinalPopulation(),
-					classifier.PeakPopulation(), classifier.WindowsEvaluated())
+					classifier.PeakPopulation(), classifier.WindowsClosed())
 			}
 			if testCase.check != nil {
 				testCase.check(t, classifier)
@@ -300,9 +303,9 @@ func TestPartialFinalWindowIsDiscarded(t *testing.T) {
 
 	classifier := classifySeries(params, constantSeries(800, params.WindowTicks-1))
 
-	if classifier.WindowsEvaluated() != 0 {
+	if classifier.WindowsClosed() != 0 {
 		t.Errorf("evaluated %d windows from %d ticks, want 0",
-			classifier.WindowsEvaluated(), params.WindowTicks-1)
+			classifier.WindowsClosed(), params.WindowTicks-1)
 	}
 	if got, want := classifier.Outcome(), OutcomeTimeout; got != want {
 		t.Errorf("outcome %s, want %s", got, want)

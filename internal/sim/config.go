@@ -42,6 +42,17 @@ type Config struct {
 	InitAgeSpread   int32 `json:"InitAgeSpread"` // initial ages uniform in [0, InitAgeSpread)
 	SearchRadius    int32 `json:"SearchRadius"`  // Chebyshev cap on nearest-food search
 
+	// BurnInWindows is a CLASSIFICATION parameter, not a simulation one: the
+	// simulation never reads it, and changing it cannot move a single state
+	// hash. It lives here for two reasons. It must travel in config_hash,
+	// because two runs classified with different burn-ins are not comparable
+	// even when their trajectories are bit-identical; and a parameter sweep
+	// addresses its axes by Config field name, so a knob that is not a Config
+	// field cannot be swept. MaxTick is here on the same footing.
+	//
+	// See stats.ClassifierConfig.BurnInWindows for what it does. Zero opts out.
+	BurnInWindows int32 `json:"BurnInWindows"`
+
 	Verify bool `json:"Verify"`
 }
 
@@ -78,6 +89,8 @@ func DefaultConfig() Config {
 		InitAgentEnergy: 50,
 		InitAgeSpread:   240,
 		SearchRadius:    12,
+
+		BurnInWindows: 1,
 
 		Verify: false,
 	}
@@ -128,6 +141,12 @@ func (c Config) Validate() error {
 		if item.value <= 0 {
 			return &ConfigError{Field: item.field, Reason: "must be positive"}
 		}
+	}
+
+	// Zero is legal and meaningful — it opts the classifier out of burn-in
+	// entirely — so this one is checked separately from the positive list.
+	if c.BurnInWindows < 0 {
+		return &ConfigError{Field: "BurnInWindows", Reason: "must not be negative (0 disables burn-in)"}
 	}
 
 	// Torus masking (idx = (y<<shift)|x, wrap = &mask) requires powers of two,
@@ -211,6 +230,7 @@ func (c Config) Hash() uint64 {
 	hash = mixInt16(hash, c.InitAgentEnergy)
 	hash = mixInt32(hash, c.InitAgeSpread)
 	hash = mixInt32(hash, c.SearchRadius)
+	hash = mixInt32(hash, c.BurnInWindows)
 	hash = mixBool(hash, c.Verify)
 
 	return hash
