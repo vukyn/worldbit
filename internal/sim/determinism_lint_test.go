@@ -5,25 +5,48 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
 
-// allowedImports is the complete set of packages internal/sim may import.
+// lintTarget is one package the determinism lint guards.
 //
-// This list is the single place where a deliberate exception to the
-// determinism contract is made. Adding an entry is a reviewable act: every
-// package here must be free of ambient state, wall-clock, randomness, I/O and
-// iteration-order nondeterminism.
-var allowedImports = map[string]bool{
-	"math/bits":       true,
-	"encoding/binary": true,
-	"sort":            true,
-	"errors":          true,
+// The allowlist on each target is the single place where a deliberate
+// exception to the determinism contract is made. Adding an entry is a
+// reviewable act: every package listed must be free of ambient state,
+// wall-clock, randomness, I/O and iteration-order nondeterminism.
+type lintTarget struct {
+	directory      string
+	name           string
+	allowedImports []string
 }
 
-// TestDeterminismLint walks the AST of every non-test file in internal/sim and
-// rejects the constructs that can silently break bit-exact reproducibility:
+// lintTargets are the packages that must stay bit-exact.
+//
+// internal/stats is here as well as internal/sim because a floating-point
+// classifier would break the determinism contract just as thoroughly as a
+// floating-point simulation: two machines would agree on every tick of state
+// and then file the same run under two different outcomes. Its allowlist
+// differs — it needs math/bits for the exact 128-bit product comparison and
+// strconv for its assertion messages, and it has no reason to touch
+// encoding/binary or sort.
+var lintTargets = []lintTarget{
+	{
+		directory:      ".",
+		name:           "internal/sim",
+		allowedImports: []string{"math/bits", "encoding/binary", "sort", "errors"},
+	},
+	{
+		directory:      "../stats",
+		name:           "internal/stats",
+		allowedImports: []string{"math/bits", "strconv"},
+	},
+}
+
+// TestDeterminismLint walks the AST of every non-test file in the guarded
+// packages and rejects the constructs that can silently break bit-exact
+// reproducibility:
 //
 //   - maps of any kind        — iteration order is randomised by the runtime
 //   - float32 / float64       — FMA fusion differs between arm64 and amd64
@@ -31,12 +54,29 @@ var allowedImports = map[string]bool{
 //   - imports outside the allowlist  — ambient state, wall-clock, randomness, I/O
 //
 // Pure go/ast, no type information required, so it stays fast and dependency
-// free. Test files are exempt: they legitimately need testing, os, fmt, reflect.
+// free. Test files are exempt: they legitimately need testing, os, fmt,
+// reflect, and — for the numerics references — math/big and math/rand.
 func TestDeterminismLint(t *testing.T) {
-	entries, err := os.ReadDir(".")
-	if err != nil {
-		t.Fatalf("read internal/sim: %v", err)
+	for _, target := range lintTargets {
+		t.Run(target.name, func(t *testing.T) {
+			lintPackage(t, target)
+		})
 	}
+}
+
+func lintPackage(t *testing.T, target lintTarget) {
+	t.Helper()
+
+	entries, err := os.ReadDir(target.directory)
+	if err != nil {
+		t.Fatalf("read %s: %v", target.name, err)
+	}
+
+	allowed := make(map[string]bool, len(target.allowedImports))
+	for _, path := range target.allowedImports {
+		allowed[path] = true
+	}
+	allowlist := strings.Join(target.allowedImports, ", ")
 
 	fileSet := token.NewFileSet()
 	inspected := 0
@@ -47,9 +87,10 @@ func TestDeterminismLint(t *testing.T) {
 			continue
 		}
 
-		file, err := parser.ParseFile(fileSet, name, nil, parser.AllErrors)
+		path := filepath.Join(target.directory, name)
+		file, err := parser.ParseFile(fileSet, path, nil, parser.AllErrors)
 		if err != nil {
-			t.Fatalf("parse %s: %v", name, err)
+			t.Fatalf("parse %s: %v", path, err)
 		}
 		inspected++
 
@@ -58,35 +99,35 @@ func TestDeterminismLint(t *testing.T) {
 		}
 
 		for _, importSpec := range file.Imports {
-			path := strings.Trim(importSpec.Path.Value, `"`)
-			if !allowedImports[path] {
-				fail(importSpec, "import "+path+" is not in the internal/sim allowlist "+
-					"(math/bits, encoding/binary, sort, errors) — see the determinism contract")
+			imported := strings.Trim(importSpec.Path.Value, `"`)
+			if !allowed[imported] {
+				fail(importSpec, "import "+imported+" is not in the "+target.name+" allowlist ("+
+					allowlist+") — see the determinism contract")
 			}
 		}
 
 		ast.Inspect(file, func(node ast.Node) bool {
 			switch typed := node.(type) {
 			case *ast.MapType:
-				fail(typed, "map type in internal/sim — map iteration order is nondeterministic; "+
+				fail(typed, "map type in "+target.name+" — map iteration order is nondeterministic; "+
 					"use a dense id-indexed slice or a sorted slice with binary search")
 			case *ast.ChanType:
-				fail(typed, "channel type in internal/sim — the simulation is single-threaded")
+				fail(typed, "channel type in "+target.name+" — this package is single-threaded")
 			case *ast.GoStmt:
-				fail(typed, "go statement in internal/sim — the simulation is single-threaded; "+
+				fail(typed, "go statement in "+target.name+" — this package is single-threaded; "+
 					"parallelism belongs in internal/runner, between runs")
 			case *ast.SelectStmt:
-				fail(typed, "select statement in internal/sim — the simulation is single-threaded")
+				fail(typed, "select statement in "+target.name+" — this package is single-threaded")
 			case *ast.SendStmt:
-				fail(typed, "channel send in internal/sim — the simulation is single-threaded")
+				fail(typed, "channel send in "+target.name+" — this package is single-threaded")
 			case *ast.Ident:
 				if typed.Name == "float32" || typed.Name == "float64" {
-					fail(typed, "identifier "+typed.Name+" in internal/sim — integer arithmetic only; "+
+					fail(typed, "identifier "+typed.Name+" in "+target.name+" — integer arithmetic only; "+
 						"floats may be FMA-fused differently per architecture")
 				}
 			case *ast.UnaryExpr:
 				if typed.Op == token.ARROW {
-					fail(typed, "channel receive in internal/sim — the simulation is single-threaded")
+					fail(typed, "channel receive in "+target.name+" — this package is single-threaded")
 				}
 			case *ast.CallExpr:
 				// Redundant with *ast.MapType (make's first argument is a type
@@ -95,7 +136,7 @@ func TestDeterminismLint(t *testing.T) {
 				ident, isIdent := typed.Fun.(*ast.Ident)
 				if isIdent && ident.Name == "make" && len(typed.Args) > 0 {
 					if _, isMap := typed.Args[0].(*ast.MapType); isMap {
-						fail(typed, "make(map[...]) in internal/sim — maps are forbidden")
+						fail(typed, "make(map[...]) in "+target.name+" — maps are forbidden")
 					}
 				}
 			}
@@ -104,6 +145,6 @@ func TestDeterminismLint(t *testing.T) {
 	}
 
 	if inspected == 0 {
-		t.Fatal("determinism lint inspected 0 files — the walker is not seeing internal/sim")
+		t.Fatalf("determinism lint inspected 0 files — the walker is not seeing %s", target.name)
 	}
 }

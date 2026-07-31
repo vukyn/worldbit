@@ -1,0 +1,306 @@
+package stats
+
+import "strconv"
+
+// Outcome is the classification of a run. The six terminal values are the
+// vocabulary the batch harness reports in; OutcomeRunning is the state of a
+// classifier that has not resolved yet.
+type Outcome uint8
+
+const (
+	// OutcomeRunning means no verdict has been reached: the run is still in
+	// progress and Finish has not been called.
+	OutcomeRunning Outcome = iota
+	// OutcomeExtinct means the population reached zero. Terminal.
+	OutcomeExtinct
+	// OutcomeStable means three consecutive windows were low-variation and
+	// flat, with a population above the floor. Terminal.
+	OutcomeStable
+	// OutcomeOscillating means at least one window had a coefficient of
+	// variation above 0.25 and the run never stabilised.
+	OutcomeOscillating
+	// OutcomeOverrun means the population passed the overrun threshold.
+	// Terminal, like extinction: such a run costs an order of magnitude more
+	// wall time per tick and tells you nothing further.
+	OutcomeOverrun
+	// OutcomeDeclining means the final window was losing more than 10 % of its
+	// mean population per window.
+	OutcomeDeclining
+	// OutcomeTimeout means the run reached the tick limit without matching any
+	// other description.
+	OutcomeTimeout
+)
+
+// String returns the uppercase name used in the CSV and JSON records.
+func (o Outcome) String() string {
+	switch o {
+	case OutcomeRunning:
+		return "RUNNING"
+	case OutcomeExtinct:
+		return "EXTINCT"
+	case OutcomeStable:
+		return "STABLE"
+	case OutcomeOscillating:
+		return "OSCILLATING"
+	case OutcomeOverrun:
+		return "OVERRUN"
+	case OutcomeDeclining:
+		return "DECLINING"
+	case OutcomeTimeout:
+		return "TIMEOUT"
+	default:
+		return "Outcome(" + strconv.Itoa(int(o)) + ")"
+	}
+}
+
+// ClassifierConfig holds the thresholds the state machine resolves against.
+//
+// It is separate from sim.Config on purpose: this package never imports the
+// simulation, so the two grid-derived numbers — how many ticks make a year and
+// what population counts as an overrun — are passed in by the caller.
+type ClassifierConfig struct {
+	// WindowTicks is the length of one evaluation window, in ticks. Windows do
+	// not overlap; the predicates are evaluated once per completed window.
+	WindowTicks int
+	// TicksPerYear converts ticks to the years used in reporting.
+	TicksPerYear int
+	// StableWindows is how many consecutive stable windows resolve a run as
+	// STABLE.
+	StableWindows int
+	// MinStablePopulation is the floor below which a window cannot count
+	// towards stability, however flat it is: a handful of survivors coasting
+	// towards extinction is not a stable ecology.
+	MinStablePopulation int
+	// OverrunPopulation is the population that must be EXCEEDED to resolve a
+	// run as OVERRUN. See OverrunPopulationFor.
+	OverrunPopulation int
+}
+
+// DefaultClassifierConfig returns the ratified thresholds: 1200-tick windows
+// (ten years at the default 120 ticks per year), three consecutive stable
+// windows, a 20-agent stability floor, and the overrun threshold for the
+// default 128x128 grid.
+func DefaultClassifierConfig() ClassifierConfig {
+	return ClassifierConfig{
+		WindowTicks:         1200,
+		TicksPerYear:        120,
+		StableWindows:       3,
+		MinStablePopulation: 20,
+		OverrunPopulation:   OverrunPopulationFor(128 * 128),
+	}
+}
+
+// OverrunPopulationFor is 40 % of the cell count, rounded down — the threshold
+// a population must exceed to count as an overrun. 6553 on the default grid.
+//
+// The result is floored at 1 so that a pathologically small grid (a 1x1 world
+// is a legal, if absurd, configuration) yields a usable threshold instead of
+// turning a config value into a panic in NewClassifier.
+func OverrunPopulationFor(cellCount int) int {
+	threshold := cellCount * 2 / 5
+	if threshold < 1 {
+		return 1
+	}
+	return threshold
+}
+
+// Classifier turns a stream of per-tick population counts into one Outcome.
+//
+// Call Observe once per completed tick, then Finish once at the tick limit.
+// The four outcomes that can be recognised mid-run are terminal, so Done
+// reports when there is nothing left to learn and the caller may stop
+// simulating.
+//
+// Resolution order is part of the design, because the outcomes overlap: a run
+// can be both wildly oscillating and finally extinct, and it is the extinction
+// that is worth reporting. Per tick, extinction and overrun win over
+// everything; on a window boundary, stability wins over the end-of-run
+// fallbacks; and at the tick limit, oscillation wins over decline, which wins
+// over an unremarkable timeout.
+type Classifier struct {
+	params ClassifierConfig
+	window Window
+
+	tick           int
+	lastPopulation int
+	peakPopulation int
+	peakTick       int
+	extinctTick    int
+
+	outcome          Outcome
+	stableStreak     int
+	windowsEvaluated int
+
+	// A window's coefficient of variation is only ever compared against 0.25,
+	// so "the maximum CV over all windows exceeded 0.25" is exactly "some
+	// window exceeded 0.25" — one bool instead of a rational running maximum
+	// that could not be represented without floats or big.Rat.
+	sawHighVariation bool
+
+	// Likewise, only the LAST window's slope is consulted at the tick limit,
+	// so the predicate is evaluated at each boundary and overwritten.
+	lastWindowDeclining bool
+}
+
+// NewClassifier returns a classifier that has seen no ticks.
+//
+// It panics on a nonsensical configuration. These values come from validated
+// simulation config or from DefaultClassifierConfig, so an invalid one is a
+// programming error, and the alternative — silently classifying against
+// thresholds nobody chose — is exactly the failure this project exists to
+// prevent.
+func NewClassifier(params ClassifierConfig) *Classifier {
+	if params.TicksPerYear < 1 {
+		panic("stats: TicksPerYear must be positive, got " + strconv.Itoa(params.TicksPerYear))
+	}
+	if params.StableWindows < 1 {
+		panic("stats: StableWindows must be positive, got " + strconv.Itoa(params.StableWindows))
+	}
+	if params.OverrunPopulation < 1 {
+		panic("stats: OverrunPopulation must be positive, got " + strconv.Itoa(params.OverrunPopulation))
+	}
+
+	return &Classifier{
+		params:      params,
+		window:      NewWindow(params.WindowTicks),
+		extinctTick: -1,
+		outcome:     OutcomeRunning,
+	}
+}
+
+// Observe records the population after one completed tick. The nth call is
+// tick n, so a caller that steps the world and then observes has the tick
+// numbering the simulation itself uses.
+//
+// Calls after a terminal outcome are ignored, so a caller that keeps running
+// past Done cannot change a verdict that has already been reached.
+func (c *Classifier) Observe(population int) {
+	if c.outcome != OutcomeRunning {
+		return
+	}
+
+	// Asserted here as well as in Window.Add, because the overrun check below
+	// returns before the sample ever reaches the window: without this, an
+	// impossible population would quietly be filed as an ordinary OVERRUN
+	// instead of exposing whatever produced it.
+	if population < 0 || population > MaxSample {
+		panic("stats: population " + strconv.Itoa(population) + " outside [0, " +
+			strconv.Itoa(MaxSample) + "] — every accumulator overflow bound depends on this limit")
+	}
+
+	c.tick++
+	c.lastPopulation = population
+
+	// Terminal per-tick checks come first, before peak tracking and before the
+	// window: both of these outcomes end the run on this tick, and neither
+	// says anything about the window it interrupts. One consequence worth
+	// knowing when reading a record: on an OVERRUN tick the peak is NOT
+	// updated, so peak_pop describes the ticks the run completed and
+	// final_pop carries the population that tripped the threshold.
+	if population == 0 {
+		c.extinctTick = c.tick
+		c.outcome = OutcomeExtinct
+		return
+	}
+	if population > c.params.OverrunPopulation {
+		c.outcome = OutcomeOverrun
+		return
+	}
+
+	if population > c.peakPopulation {
+		c.peakPopulation = population
+		c.peakTick = c.tick
+	}
+
+	if c.window.Add(population) {
+		c.evaluateWindow(population)
+		c.window.Reset()
+	}
+}
+
+// evaluateWindow applies the boundary rules to the window that has just
+// closed. population is the last sample in it, which is also the current
+// population and therefore what the stability floor is tested against.
+func (c *Classifier) evaluateWindow(population int) {
+	c.windowsEvaluated++
+
+	// "Stable" is both halves of the specification's stable predicate: low
+	// variation AND a flat trend. Low variation alone would accept a
+	// population sliding smoothly and unrecoverably downwards.
+	stable := c.window.StableVariation() && c.window.FlatSlope()
+
+	if stable && population >= c.params.MinStablePopulation {
+		c.stableStreak++
+		if c.stableStreak >= c.params.StableWindows {
+			c.outcome = OutcomeStable
+		}
+	} else {
+		// The streak must be CONSECUTIVE: one unstable window in the middle of
+		// four stable ones is a run that has not settled.
+		c.stableStreak = 0
+	}
+
+	c.sawHighVariation = c.sawHighVariation || c.window.HighVariation()
+	c.lastWindowDeclining = c.window.DecliningSlope()
+}
+
+// Finish resolves a run that reached the tick limit without a terminal
+// outcome, and returns the final verdict. It is idempotent, and returns the
+// terminal outcome unchanged if one was already reached.
+//
+// The partially-filled window at the tick limit is deliberately discarded: it
+// holds fewer samples than every other window, so its predicates are not
+// comparable with theirs.
+func (c *Classifier) Finish() Outcome {
+	if c.outcome != OutcomeRunning {
+		return c.outcome
+	}
+
+	switch {
+	case c.sawHighVariation:
+		c.outcome = OutcomeOscillating
+	case c.lastWindowDeclining:
+		c.outcome = OutcomeDeclining
+	default:
+		c.outcome = OutcomeTimeout
+	}
+	return c.outcome
+}
+
+// Outcome is the verdict so far: OutcomeRunning until a terminal outcome is
+// reached or Finish is called.
+func (c *Classifier) Outcome() Outcome { return c.outcome }
+
+// Done reports whether the outcome is settled and the caller may stop
+// simulating. Extinction, overrun and stability are all terminal.
+func (c *Classifier) Done() bool { return c.outcome != OutcomeRunning }
+
+// Tick is the number of ticks observed.
+func (c *Classifier) Tick() int { return c.tick }
+
+// FinalPopulation is the population of the most recently observed tick.
+func (c *Classifier) FinalPopulation() int { return c.lastPopulation }
+
+// PeakPopulation is the highest population observed on a non-terminal tick.
+func (c *Classifier) PeakPopulation() int { return c.peakPopulation }
+
+// PeakTick is the tick at which PeakPopulation was first reached.
+func (c *Classifier) PeakTick() int { return c.peakTick }
+
+// PeakYear is PeakTick expressed in simulated years.
+func (c *Classifier) PeakYear() int { return c.peakTick / c.params.TicksPerYear }
+
+// ExtinctYear is the year the population reached zero, or -1 if it never did.
+func (c *Classifier) ExtinctYear() int {
+	if c.extinctTick < 0 {
+		return -1
+	}
+	return c.extinctTick / c.params.TicksPerYear
+}
+
+// WindowsEvaluated is the number of complete windows the run produced.
+func (c *Classifier) WindowsEvaluated() int { return c.windowsEvaluated }
+
+// StableStreak is the number of consecutive stable windows ending at the most
+// recent boundary.
+func (c *Classifier) StableStreak() int { return c.stableStreak }
