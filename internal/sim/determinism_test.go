@@ -14,11 +14,6 @@ import (
 var update = flag.Bool("update", false, "regenerate testdata/golden_hashes.csv")
 
 // goldenSeeds and goldenTicks pin the regression fixture.
-//
-// Until agents exist the trajectory is seed-independent (only regrowth runs),
-// so every seed currently yields the same digest. The fixture is written with
-// all eight seeds anyway so that the shape is already right when agents make
-// the seeds diverge.
 var goldenSeeds = []uint64{1, 2, 3, 4, 5, 6, 7, 8}
 
 var goldenTicks = []int32{100, 1000, 12000}
@@ -98,6 +93,34 @@ func TestGoldenHashes(t *testing.T) {
 
 	if index != len(expected) {
 		t.Errorf("golden file has %d rows, the run produced %d", len(expected), index)
+	}
+}
+
+// TestGoldenHashesDifferPerSeed asserts the fixture is actually measuring
+// something.
+//
+// Before agents existed only regrowth ran, so every seed produced the identical
+// digest and the eight-seed fixture was eight copies of one number. Identical
+// hashes across seeds now would mean the agents are not influencing state at
+// all — a whole simulation quietly reduced to a food-regrowth clock, with a
+// full set of green determinism tests to prove it.
+func TestGoldenHashesDifferPerSeed(t *testing.T) {
+	cfg := DefaultConfig()
+
+	for _, tick := range goldenTicks {
+		seen := make(map[uint64]uint64, len(goldenSeeds))
+		for _, seed := range goldenSeeds {
+			world := NewWorld(seed, cfg)
+			Run(world, tick)
+
+			hash := Hash(world)
+			if other, collides := seen[hash]; collides {
+				t.Errorf("tick %d: seeds %d and %d produced the same state hash %016x — "+
+					"the seed is not reaching agent behaviour", tick, other, seed, hash)
+				continue
+			}
+			seen[hash] = seed
+		}
 	}
 }
 

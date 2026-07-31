@@ -40,6 +40,8 @@ func (w *World) regrow() {
 		}
 		if cell.Food < foodMax {
 			cell.Food++
+			w.blockFood[w.blockOf(index)]++
+			w.ledger.regrown++
 		}
 	}
 }
