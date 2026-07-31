@@ -11,12 +11,13 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"time"
 
 	"github.com/urfave/cli/v2"
 
 	"github.com/vukyn/worldbit/internal/config"
+	"github.com/vukyn/worldbit/internal/runner"
 	"github.com/vukyn/worldbit/internal/sim"
-	"github.com/vukyn/worldbit/internal/stats"
 )
 
 // version is written into every output record, so a "same seed, different
@@ -86,6 +87,10 @@ func appFlags() []cli.Flag {
 		&cli.StringSliceFlag{
 			Name:  "set",
 			Usage: "single-parameter override, repeatable: --set InitFoodPerCell=3 --set FoodMax=8",
+		},
+		&cli.StringFlag{
+			Name:  "sweep",
+			Usage: "JSON parameter-grid file; runs every cell of the grid over --seeds seeds (batch only)",
 		},
 		&cli.StringFlag{
 			Name:  "dump-config",
@@ -158,71 +163,123 @@ func resolveConfig(c *cli.Context) (sim.Config, error) {
 	return cfg, nil
 }
 
-// runHeadless is the batch entry point. The worker pool and the CSV/JSON
-// writers arrive with the batch runner; for now it runs a single world,
-// classifies its outcome and reports its canonical hash.
+// runHeadless is the batch entry point: it resolves the grid to run, reports
+// its size before starting, runs it, and writes the results.
 func runHeadless(c *cli.Context, cfg sim.Config) error {
-	seed := c.Uint64("seed")
-	hashEvery := int32(c.Int("hash-every"))
-
-	if c.IsSet("runs") || c.IsSet("out") || c.IsSet("workers") {
-		fmt.Fprintln(os.Stderr,
-			"worldbit: --runs/--out/--workers are accepted but not wired yet; the batch runner "+
-				"lands in the next phase. Running a single seed.")
+	options := runner.Options{
+		Cells:     []runner.Cell{{Index: 0, Config: cfg}},
+		SeedStart: c.Uint64("seed"),
+		Seeds:     c.Int("runs"),
+		Workers:   c.Int("workers"),
+		Version:   version,
+		HashEvery: int32(c.Int("hash-every")),
+		Log:       os.Stdout,
 	}
 
-	world := sim.NewWorld(seed, cfg)
-	classifier := stats.NewClassifier(classifierParams(cfg))
-
-	fmt.Printf("seed=%d ticks=%d config_hash=%016x version=%s\n", seed, cfg.MaxTick, cfg.Hash(), version)
-	if err := world.VerifyError(); err != nil {
-		return fmt.Errorf("invariant broken at tick %d: %w", world.Tick, err)
-	}
-
-	for world.Tick < cfg.MaxTick {
-		sim.Step(world)
-
-		// One sample per completed tick, so the classifier's tick numbering is
-		// the simulation's. A terminal outcome makes later samples no-ops; the
-		// run still goes the distance here because --verify and --hash-every
-		// are diagnostics that want the whole trajectory. Stopping early on a
-		// terminal outcome is the batch runner's job, where the wall time
-		// saved is the point.
-		classifier.Observe(int(world.Population()))
-
-		// Reported on the tick it happens: past the first violation every
-		// later tick is built on known-bad state and only buries the cause.
-		if err := world.VerifyError(); err != nil {
-			return fmt.Errorf("invariant broken at tick %d: %w", world.Tick, err)
-		}
-		if hashEvery > 0 && world.Tick%hashEvery == 0 {
-			fmt.Printf("tick=%d hash=%016x\n", world.Tick, sim.Hash(world))
+	sweeping := c.String("sweep") != ""
+	if sweeping {
+		var err error
+		if options, err = applySweep(c, cfg, options); err != nil {
+			return err
 		}
 	}
+	if options.Seeds < 1 {
+		return fmt.Errorf("--runs must be positive, got %d", options.Seeds)
+	}
 
-	outcome := classifier.Finish()
-	fmt.Printf("tick=%d pop=%d outcome=%s peak_pop=%d peak_year=%d extinct_year=%d state_hash=%016x\n",
-		world.Tick, world.Population(), outcome,
-		classifier.PeakPopulation(), classifier.PeakYear(), classifier.ExtinctYear(),
-		sim.Hash(world))
+	reportPlan(options)
+
+	records, err := runner.Run(options)
+	if err != nil {
+		return err
+	}
+
+	out := c.String("out")
+	if err := runner.Write(out, records, version, cfg.Hash()); err != nil {
+		return err
+	}
+	if err := config.Dump(cfg, runner.SidecarPath(out)); err != nil {
+		return err
+	}
+	fmt.Printf("wrote %s and %s\n", out, runner.SidecarPath(out))
+
+	if sweeping {
+		summaryPath := runner.CellSummaryPath(out)
+		if err := runner.WriteCellSummary(summaryPath, records); err != nil {
+			return err
+		}
+		fmt.Printf("wrote %s (%d cells)\n", summaryPath, len(runner.SummariseCells(records)))
+	}
+
+	fmt.Printf("outcomes: %s\n", runner.FormatOutcomeCounts(runner.OutcomeCounts(records)))
 	if cfg.Verify {
-		fmt.Println("invariants held on every tick")
+		fmt.Println("invariants held on every tick of every run")
 	}
 	return nil
 }
 
-// classifierParams maps the simulation config onto the classifier's
-// thresholds. Only the two grid-derived numbers travel: internal/stats never
-// imports internal/sim, so that the classifier stays independently testable
-// against hand-built series and the simulation stays free of statistics.
-//
-// The window length is deliberately NOT derived from TicksPerYear: an
-// externally-configured TicksPerYear could then push the window past the size
-// the integer accumulators are proven safe for, turning a config value into a
-// panic.
-func classifierParams(cfg sim.Config) stats.ClassifierConfig {
-	params := stats.DefaultClassifierConfig()
-	params.TicksPerYear = int(cfg.TicksPerYear)
-	params.OverrunPopulation = stats.OverrunPopulationFor(int(cfg.Width) * int(cfg.Height))
-	return params
+// applySweep replaces the single base cell with the sweep's grid. The sweep
+// file governs the seed range, because "seeds" and "seed_start" live in it;
+// --runs and --seed are reported as ignored rather than silently overridden.
+func applySweep(c *cli.Context, cfg sim.Config, options runner.Options) (runner.Options, error) {
+	sweep, err := config.LoadSweep(c.String("sweep"))
+	if err != nil {
+		return options, err
+	}
+
+	if c.IsSet("runs") || c.IsSet("seed") {
+		fmt.Fprintln(os.Stderr,
+			"worldbit: --seed/--runs are ignored under --sweep; the sweep file's seeds and "+
+				"seed_start govern the seed range")
+	}
+
+	expanded, skipped := sweep.Expand(cfg)
+	for _, cell := range skipped {
+		fmt.Fprintf(os.Stderr, "worldbit: skipping cell %d (%s): %v\n",
+			cell.Index, config.DescribeAxes(cell.Axes), cell.Err)
+	}
+	if len(skipped) > 0 {
+		fmt.Fprintf(os.Stderr, "worldbit: skipped %d of %d cells as invalid\n",
+			len(skipped), sweep.CellCount())
+	}
+	if len(expanded) == 0 {
+		return options, fmt.Errorf("sweep: all %d cells were invalid; nothing to run", sweep.CellCount())
+	}
+
+	options.Cells = make([]runner.Cell, len(expanded))
+	for i, cell := range expanded {
+		axes := make([]runner.Axis, len(cell.Axes))
+		for j, axis := range cell.Axes {
+			axes[j] = runner.Axis{Name: axis.Name, Value: axis.Value}
+		}
+		options.Cells[i] = runner.Cell{Index: cell.Index, Config: cell.Config, Axes: axes}
+	}
+	options.SeedStart = sweep.SeedStart
+	options.Seeds = sweep.Seeds
+
+	return options, nil
+}
+
+// reportPlan prints the size of the batch and an estimate of how long it will
+// take BEFORE it starts. There are no silent caps in this harness, so the one
+// protection against accidentally launching a six-hour sweep is knowing that is
+// what you launched.
+func reportPlan(options runner.Options) {
+	if options.HashEvery > 0 && options.Workers > 1 {
+		fmt.Fprintln(os.Stderr,
+			"worldbit: --hash-every forces a single worker so the trace stays ordered")
+	}
+	fmt.Printf("worldbit %s: %d cells x %d seeds = %d runs, ~%s estimated\n",
+		version, len(options.Cells), options.Seeds, runner.TotalRuns(options),
+		roundEstimate(runner.EstimatedDuration(options)))
+}
+
+// roundEstimate trims an estimate to a legible precision. A minute-plus figure
+// rounded to the second reads well; a sub-minute one rounded the same way turns
+// a real few hundred milliseconds into a misleading "0s".
+func roundEstimate(estimate time.Duration) time.Duration {
+	if estimate >= time.Minute {
+		return estimate.Round(time.Second)
+	}
+	return estimate.Round(100 * time.Millisecond)
 }

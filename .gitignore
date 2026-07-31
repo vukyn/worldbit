@@ -17,8 +17,13 @@ venv/
 
 # Experiment outputs (disposable; testdata/golden_hashes.csv is NOT ignored)
 runs*.csv
+runs*.json
+sweep*.csv
+sweep*.json
 out/
-runs*.config.json
+# Sidecars and aggregates the batch runner writes next to any --out path
+*.config.json
+*.cells.csv
 
 # Agent-local memory (never committed)
 .claude/

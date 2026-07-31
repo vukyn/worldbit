@@ -47,6 +47,7 @@ worldbit [flags]
 --workers, -w  int      batch parallelism                                   (default GOMAXPROCS)
 --config, -c   string   JSON config file; absent fields keep their defaults (default none)
 --set          k=v      single-parameter override, repeatable
+--sweep        string   JSON parameter-grid file; runs every cell (batch)   (default none)
 --dump-config  string   write the resolved config as JSON and exit
 --verify                enable sim invariant assertions (slow)              (default false)
 --hash-every   int      print the state hash every N ticks (0 = off)        (default 0)
@@ -85,17 +86,100 @@ nothing may hardcode a value that belongs there. Adding a field means adding it
 to `Hash()`, to `Validate()` if a rule applies, and giving it a `json` tag —
 `TestConfigHashChangesWithEveryField` enforces the first.
 
+### Parameter sweeps
+
+Seed variation alone produces near-identical runs at a fixed parameter set —
+the variety lives in the parameters. `--sweep` runs a grid:
+
+```json
+{
+  "seeds": 20,
+  "seed_start": 1,
+  "axes": {
+    "InitFoodPerCell": [1, 3, 5],
+    "ReproEnergyCost": [30, 40, 50],
+    "FoodRegrowTicks": [25, 100, 400, 1600, 6400]
+  }
+}
+```
+
+```bash
+worldbit --headless --sweep grid.json --out sweep.csv
+```
+
+Axis keys are `Config` field names, resolved through **the same code `--set`
+uses**, so an unknown key is a hard error exactly as it is for `--config`. Cells
+are the Cartesian product of the axes; each runs `seeds` runs, and the base
+config resolves as usual (defaults → `--config` → `--set`) before a cell layers
+its axis values on top. `Validate()` then runs **per cell**: an invalid cell is
+reported by name and skipped, so one impossible corner of a grid does not throw
+away the rest of it.
+
+The total run count and a wall-time estimate are printed **before** the sweep
+starts. There are no silent caps in this harness, so knowing what you launched
+is the only protection against launching a six-hour sweep by accident.
+
 ### Output schema
 
-One row per seed, fixed column order, LF endings, hashes as `%016x`:
+One row per run, fixed column order, LF endings, hashes as `%016x`:
 
 ```
 seed, outcome, peak_pop, peak_year, extinct_year, final_pop, final_tick, state_hash, config_hash, version, wall_ms
 ```
 
+Under `--sweep`, one column per swept axis is appended **after** those eleven,
+so a row is self-describing and a tool that knows the canonical schema keeps
+working. `config_hash` is always the hash of the config *that row* used, which
+in a sweep is the cell's, not the base's.
+
 `wall_ms` is the one non-deterministic column (capacity planning) — exclude it
 from any result diff. **Two records with different `config_hash` are not
 comparable**; a diff tool must refuse to compare them.
+
+Results are sorted by cell index and then by seed before writing, so two runs of
+the same batch at different worker counts produce files that are **identical
+apart from `wall_ms`**. They cannot be byte-identical while a wall-clock column
+is in the schema — blank that column before comparing two result files.
+
+Two more files are written next to `--out`:
+
+| File | Contents |
+|---|---|
+| `<out>.config.json` | the resolved base config, so a result set is reproducible on its own |
+| `<out>.cells.csv` | (sweeps only) one row per cell: axis values, the count of each of the six outcomes, and mean/median peak and final population |
+
+The aggregate is what answers *which parameter region is interesting*; the
+per-run file says what each individual seed did.
+
+**Early stop.** EXTINCT and OVERRUN end a run where they happen and the actual
+tick is recorded in `final_tick` — an overrun run costs roughly thirteen times a
+normal one per tick, which across a sweep is the difference between minutes and
+hours. STABLE is terminal for the classifier but deliberately does **not** stop
+the simulation, so `final_pop`, `final_tick` and `state_hash` describe the same
+point in time for stable runs as for every other kind and replay verification
+keeps working.
+
+### Classifier burn-in
+
+Window 1 of every run contains the startup transient: the founding population is
+fed by the initial pantry, booms far past the carrying capacity, and crashes
+back. That window can never be stable, and its coefficient of variation would
+latch the high-variation flag for the rest of the run — making OSCILLATING the
+automatic end-of-run fallback for any run that fails to string together three
+stable windows. OSCILLATING would then mean *"did not reach STABLE in time"*
+rather than *"genuinely oscillating"*, and would mislabel whole regions of a
+sweep.
+
+`BurnInWindows` (default **1**) excludes that many leading windows from **every**
+predicate — the stable streak, the high-variation flag and the declining-slope
+fallback alike. The windows are still accumulated and still advance the
+boundary, and the per-tick EXTINCT and OVERRUN checks still fire during them.
+`--set BurnInWindows=0` reproduces the un-burnt-in behaviour exactly.
+
+It is a classification parameter, not a simulation one — it cannot move a single
+state hash — but it lives in `Config` so that it travels in `config_hash` (two
+runs classified with different burn-ins are not comparable) and so that a sweep
+can vary it.
 
 ### Replaying a seed
 
@@ -153,14 +237,44 @@ sim    -> {}   stdlib only
 ```
 
 - `internal/sim` — the pure, integer-only, single-threaded simulation.
-- `internal/config` — file and flag resolution. Lives outside `sim` precisely
-  so that `sim` never touches `os`.
+- `internal/config` — file, flag and sweep resolution. Lives outside `sim`
+  precisely so that `sim` never touches `os`, and outside `runner` so that the
+  one-way graph above holds.
 - `internal/stats`, `internal/runner`, `internal/gui` — classifier, batch
-  harness, viewer (later phases).
+  harness, viewer (the last of these is a later phase).
+
+Parallelism exists in `internal/runner` and only there, and only **between**
+runs: each worker builds its own `World` and shares no simulation state.
+`TestRunnerParallelMatchesSerial` proves that one worker and eight produce
+identical files once `wall_ms` is blanked.
 
 ## Status
 
-Phase 1: repository skeleton and determinism harness. The world has cells and
-food regrowth and is hash-stable and golden-pinned; agents, the outcome
-classifier, the batch runner and the GUI are the following phases. `docs/plan.md`
-is the full design.
+Phases 1–4 are done: the determinism harness, agents, the outcome classifier
+and the batch runner with parameter sweeps. The GUI (phase 5) is still a stub —
+`go run . --seed 1` reports that the viewer has not landed. `docs/plan.md` is
+the full design.
+
+### What the parameters actually do
+
+Mapped by a 45-cell sweep over `InitFoodPerCell` × `ReproEnergyCost` ×
+`FoodRegrowTicks`, 20 seeds per cell. `FoodRegrowTicks` dominates, because it
+sets the carrying capacity (`cells / FoodRegrowTicks × EnergyPerFood /
+BurnPerTick`); the other two mostly move the height of the opening boom:
+
+| `FoodRegrowTicks` | Capacity | Outcome |
+|---|---|---|
+| 25 | ~6550 | OVERRUN, every seed |
+| 100 | ~1640 | STABLE, every seed |
+| 400 | ~410 | STABLE / TIMEOUT mix, a few DECLINING |
+| 1600 | ~102 | TIMEOUT, a few DECLINING |
+| 6400 | ~26 | OSCILLATING, every seed |
+
+EXTINCT needs a metabolic squeeze rather than a food one: `BurnPerTick=5`
+extinguishes every seed at `FoodRegrowTicks` ≥ 1600.
+
+The **defaults sit at `FoodRegrowTicks=200`**, between the all-STABLE and mixed
+bands: a 1000-seed batch there is 966 STABLE, 33 TIMEOUT, 1 DECLINING, and
+EXTINCT / OVERRUN / OSCILLATING are unreachable. That is a deliberately quiet
+region, which is what makes it a good baseline — but a sweep, not a seed batch,
+is the way to exercise the classifier.

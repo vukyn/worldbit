@@ -74,12 +74,34 @@ type ClassifierConfig struct {
 	// OverrunPopulation is the population that must be EXCEEDED to resolve a
 	// run as OVERRUN. See OverrunPopulationFor.
 	OverrunPopulation int
+	// BurnInWindows is how many leading windows are excluded from EVERY
+	// predicate: the stable streak, the high-variation flag and the
+	// declining-slope fallback alike.
+	//
+	// A run opens with a startup transient — the founding population is fed by
+	// the initial pantry, booms far past the carrying capacity and crashes back
+	// — so the first window can never satisfy the stable predicate. Its
+	// enormous coefficient of variation then latches the high-variation flag,
+	// and OSCILLATING becomes the end-of-run fallback for every run that fails
+	// to string together StableWindows stable windows. OSCILLATING would then
+	// mean "did not reach STABLE in time" rather than "genuinely oscillating",
+	// which mislabels whole regions of a parameter sweep.
+	//
+	// The excluded windows are still accumulated and still advance the
+	// boundary, so window numbering and the tick timeline are unaffected. A
+	// burn-in that some predicates respect and others ignore would be worse
+	// than none, because the resulting verdict would answer no single question.
+	//
+	// Zero opts out entirely and reproduces the un-burnt-in behaviour exactly.
+	// A value larger than the number of windows a run produces is legal: no
+	// predicate is ever evaluated, and the run resolves as TIMEOUT.
+	BurnInWindows int
 }
 
 // DefaultClassifierConfig returns the ratified thresholds: 1200-tick windows
 // (ten years at the default 120 ticks per year), three consecutive stable
-// windows, a 20-agent stability floor, and the overrun threshold for the
-// default 128x128 grid.
+// windows, a 20-agent stability floor, one burn-in window, and the overrun
+// threshold for the default 128x128 grid.
 func DefaultClassifierConfig() ClassifierConfig {
 	return ClassifierConfig{
 		WindowTicks:         1200,
@@ -87,6 +109,7 @@ func DefaultClassifierConfig() ClassifierConfig {
 		StableWindows:       3,
 		MinStablePopulation: 20,
 		OverrunPopulation:   OverrunPopulationFor(128 * 128),
+		BurnInWindows:       1,
 	}
 }
 
@@ -127,9 +150,9 @@ type Classifier struct {
 	peakTick       int
 	extinctTick    int
 
-	outcome          Outcome
-	stableStreak     int
-	windowsEvaluated int
+	outcome       Outcome
+	stableStreak  int
+	windowsClosed int
 
 	// A window's coefficient of variation is only ever compared against 0.25,
 	// so "the maximum CV over all windows exceeded 0.25" is exactly "some
@@ -158,6 +181,9 @@ func NewClassifier(params ClassifierConfig) *Classifier {
 	}
 	if params.OverrunPopulation < 1 {
 		panic("stats: OverrunPopulation must be positive, got " + strconv.Itoa(params.OverrunPopulation))
+	}
+	if params.BurnInWindows < 0 {
+		panic("stats: BurnInWindows must not be negative, got " + strconv.Itoa(params.BurnInWindows))
 	}
 
 	return &Classifier{
@@ -222,7 +248,19 @@ func (c *Classifier) Observe(population int) {
 // closed. population is the last sample in it, which is also the current
 // population and therefore what the stability floor is tested against.
 func (c *Classifier) evaluateWindow(population int) {
-	c.windowsEvaluated++
+	index := c.windowsClosed
+	c.windowsClosed++
+
+	// Burn-in windows advance the boundary but answer no question. Returning
+	// before every predicate — not just before the variation flag — is the
+	// whole point: a burn-in that suppressed the high-variation latch while
+	// still letting the startup crash reset the stable streak would delay
+	// STABLE by exactly as many windows as it excluded, and a burn-in that
+	// suppressed the streak but not the latch would still make OSCILLATING the
+	// universal fallback. See ClassifierConfig.BurnInWindows.
+	if index < c.params.BurnInWindows {
+		return
+	}
 
 	// "Stable" is both halves of the specification's stable predicate: low
 	// variation AND a flat trend. Low variation alone would accept a
@@ -298,8 +336,13 @@ func (c *Classifier) ExtinctYear() int {
 	return c.extinctTick / c.params.TicksPerYear
 }
 
-// WindowsEvaluated is the number of complete windows the run produced.
-func (c *Classifier) WindowsEvaluated() int { return c.windowsEvaluated }
+// WindowsClosed is the number of complete windows the run produced, INCLUDING
+// the burn-in windows that no predicate was evaluated on.
+func (c *Classifier) WindowsClosed() int { return c.windowsClosed }
+
+// BurnInWindows is how many leading windows this classifier excludes from its
+// predicates. See ClassifierConfig.BurnInWindows.
+func (c *Classifier) BurnInWindows() int { return c.params.BurnInWindows }
 
 // StableStreak is the number of consecutive stable windows ending at the most
 // recent boundary.

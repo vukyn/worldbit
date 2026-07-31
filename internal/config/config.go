@@ -87,14 +87,20 @@ func ApplyOverrides(cfg *sim.Config, overrides []string) error {
 			return fmt.Errorf("--set %q: empty key", override)
 		}
 
-		if err := setField(cfg, key, rawValue); err != nil {
-			return err
+		if err := SetField(cfg, key, rawValue); err != nil {
+			return fmt.Errorf("--set %w", err)
 		}
 	}
 	return nil
 }
 
-func setField(cfg *sim.Config, key, rawValue string) error {
+// SetField applies one PascalCase parameter name and its textual value to a
+// config. It is the single name-resolution path in the program: --set, the
+// --config file's error hints and the sweep's axis keys all go through it, so
+// the three cannot drift into accepting different spellings.
+//
+// Errors are unprefixed, so each caller can name its own surface.
+func SetField(cfg *sim.Config, key, rawValue string) error {
 	structValue := reflect.ValueOf(cfg).Elem()
 	structType := structValue.Type()
 
@@ -106,7 +112,7 @@ func setField(cfg *sim.Config, key, rawValue string) error {
 		}
 	}
 	if fieldIndex < 0 {
-		return fmt.Errorf("--set %s: unknown parameter (see --dump-config for the full list)", key)
+		return fmt.Errorf("%s: unknown parameter (see --dump-config for the full list)", key)
 	}
 
 	field := structValue.Field(fieldIndex)
@@ -116,17 +122,17 @@ func setField(cfg *sim.Config, key, rawValue string) error {
 	case reflect.Bool:
 		parsed, err := strconv.ParseBool(rawValue)
 		if err != nil {
-			return fmt.Errorf("--set %s=%s: expected true or false", name, rawValue)
+			return fmt.Errorf("%s=%s: expected true or false", name, rawValue)
 		}
 		field.SetBool(parsed)
 	case reflect.Int16, reflect.Int32, reflect.Int64, reflect.Int:
 		parsed, err := strconv.ParseInt(rawValue, 10, field.Type().Bits())
 		if err != nil {
-			return fmt.Errorf("--set %s=%s: expected an integer that fits in %s", name, rawValue, field.Type())
+			return fmt.Errorf("%s=%s: expected an integer that fits in %s", name, rawValue, field.Type())
 		}
 		field.SetInt(parsed)
 	default:
-		return fmt.Errorf("--set %s: unsupported field kind %s", name, field.Kind())
+		return fmt.Errorf("%s: unsupported field kind %s", name, field.Kind())
 	}
 
 	return nil
