@@ -172,6 +172,13 @@ func (c Config) Validate() error {
 	if c.SearchRadius > c.Width || c.SearchRadius > c.Height {
 		return &ConfigError{Field: "SearchRadius", Reason: "must not exceed the grid dimensions"}
 	}
+	// The Chebyshev ring offset table is precomputed once at process start, so
+	// it has a fixed bound. The bound is not arbitrary: past half the grid a
+	// torus ring wraps onto itself and revisits cells, so a larger radius would
+	// not look further, it would look at the same cells twice.
+	if c.SearchRadius > maxRingRadius {
+		return &ConfigError{Field: "SearchRadius", Reason: "must not exceed 64 (the precomputed ring table); a larger radius wraps around the torus and rescans the same cells"}
+	}
 
 	return nil
 }

@@ -2,6 +2,25 @@ package sim
 
 import "testing"
 
+// emptyWorld builds a world with no agents at all, for the tests that pin
+// phase 1 in isolation.
+//
+// Removing the founders is enough to keep it agent-free forever: nothing but a
+// birth creates an agent, and a birth needs a parent. Config.Validate rejects
+// InitAgents = 0, so this is the honest way to get an empty world without
+// loosening a rule that exists for real runs.
+func emptyWorld(t *testing.T, cfg Config) *World {
+	t.Helper()
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("test config invalid: %v", err)
+	}
+
+	world := NewWorld(1, cfg)
+	world.Agents = world.Agents[:0]
+	return world
+}
+
 // TestRegrowthStrideCoversEachCellExactlyOnce pins the stride scheme: over one
 // full FoodRegrowTicks period every cell regrows exactly once, and no tick
 // touches a cell twice. A synchronised global pulse would pass a naive
@@ -11,11 +30,8 @@ func TestRegrowthStrideCoversEachCellExactlyOnce(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.FoodMax = 100 // high enough that no cell can saturate during the period
 	cfg.InitFoodPerCell = 1
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("test config invalid: %v", err)
-	}
 
-	world := NewWorld(1, cfg)
+	world := emptyWorld(t, cfg)
 	cellCount := int32(len(world.Cells))
 	stride := cfg.FoodRegrowTicks
 
@@ -67,7 +83,7 @@ func TestRegrowthStrideCoversEachCellExactlyOnce(t *testing.T) {
 // every tick, including well past full saturation.
 func TestFoodNeverExceedsMaxOrGoesNegative(t *testing.T) {
 	cfg := DefaultConfig()
-	world := NewWorld(1, cfg)
+	world := emptyWorld(t, cfg)
 
 	// Enough ticks to saturate the board several times over: every cell
 	// regrows once per 200 ticks, so 200 * FoodMax ticks fills it.
@@ -118,8 +134,8 @@ func TestNewWorldStartsClean(t *testing.T) {
 	if got := len(world.Cells); got != int(cfg.Width*cfg.Height) {
 		t.Errorf("len(Cells) = %d, want %d", got, cfg.Width*cfg.Height)
 	}
-	if len(world.Agents) != 0 {
-		t.Errorf("len(Agents) = %d, want 0 — agents arrive in the next phase", len(world.Agents))
+	if got := int32(len(world.Agents)); got != cfg.InitAgents {
+		t.Errorf("len(Agents) = %d, want InitAgents %d", got, cfg.InitAgents)
 	}
 	for i := range world.Cells {
 		if world.Cells[i].Biome != BiomePlain {

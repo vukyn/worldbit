@@ -172,14 +172,26 @@ func runHeadless(c *cli.Context, cfg sim.Config) error {
 
 	world := sim.NewWorld(seed, cfg)
 	fmt.Printf("seed=%d ticks=%d config_hash=%016x version=%s\n", seed, cfg.MaxTick, cfg.Hash(), version)
+	if err := world.VerifyError(); err != nil {
+		return fmt.Errorf("invariant broken at tick %d: %w", world.Tick, err)
+	}
 
 	for world.Tick < cfg.MaxTick {
 		sim.Step(world)
+
+		// Reported on the tick it happens: past the first violation every
+		// later tick is built on known-bad state and only buries the cause.
+		if err := world.VerifyError(); err != nil {
+			return fmt.Errorf("invariant broken at tick %d: %w", world.Tick, err)
+		}
 		if hashEvery > 0 && world.Tick%hashEvery == 0 {
 			fmt.Printf("tick=%d hash=%016x\n", world.Tick, sim.Hash(world))
 		}
 	}
 
 	fmt.Printf("tick=%d pop=%d state_hash=%016x\n", world.Tick, world.Population(), sim.Hash(world))
+	if cfg.Verify {
+		fmt.Println("invariants held on every tick")
+	}
 	return nil
 }
