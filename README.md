@@ -181,6 +181,40 @@ state hash — but it lives in `Config` so that it travels in `config_hash` (two
 runs classified with different burn-ins are not comparable) and so that a sweep
 can vary it.
 
+### High-variation population floor
+
+The coefficient of variation is **scale-free**, and the OSCILLATING predicate
+compares it against a fixed 0.25. Demographic noise in a population of mean *p*
+has a standard deviation of about √*p*, so its coefficient of variation is about
+1/√*p*:
+
+| Mean population | Coefficient of variation from noise alone | 0.25 line sits |
+|---|---|---|
+| 16 | 0.25 | **at** the noise floor — the predicate cannot fail |
+| 64 | 0.125 | at twice the noise floor |
+| 700 | 0.038 | far above noise |
+
+So without a floor, a starving remnant of a dozen agents is reported as an
+oscillating ecology purely because small numbers are noisy — which is exactly
+what the P4 sweep found.
+
+`MinOscillatingPopulation` (default **64**) is the mean population a window must
+reach before its variation may count. It mirrors `MinStablePopulation`, with one
+deliberate difference: it tests the window **mean** rather than the population at
+the boundary, because the coefficient of variation is a property of the whole
+window. The comparison is the exact integer `S1 >= floor·n` — no division, no new
+accumulator. `--set MinOscillatingPopulation=0` reproduces the un-floored
+behaviour exactly.
+
+The default is derived rather than chosen: 64 is where the 0.25 line sits at
+twice the demographic-noise level, so clearing it requires a population genuinely
+twice as variable as chance. Measurement over a 1200-run grid agrees — above a
+mean of 40 not one firing window is noise-explainable, while 97 % of windows
+below a mean of 8 fire and their variation is indistinguishable from pure noise.
+
+Like `BurnInWindows`, it is a classification parameter that cannot move a state
+hash, and lives in `Config` so it travels in `config_hash` and can be swept.
+
 ### Replaying a seed
 
 Run the batch, pick a seed whose outcome looks interesting, then re-simulate it
@@ -268,10 +302,18 @@ BurnPerTick`); the other two mostly move the height of the opening boom:
 | 100 | ~1640 | STABLE, every seed |
 | 400 | ~410 | STABLE / TIMEOUT mix, a few DECLINING |
 | 1600 | ~102 | TIMEOUT, a few DECLINING |
-| 6400 | ~26 | OSCILLATING, every seed |
+| 6400 | ~26 | TIMEOUT, a few DECLINING (was OSCILLATING before the population floor) |
 
 EXTINCT needs a metabolic squeeze rather than a food one: `BurnPerTick=5`
 extinguishes every seed at `FoodRegrowTicks` ≥ 1600.
+
+**Genuine oscillation lives at high burn and moderate regrowth**, a region the
+first sweep did not cover: `BurnPerTick=5` with `FoodRegrowTicks` 300–800
+produces a real limit cycle, 20/20 seeds, with the population swinging roughly
+between a third and double the carrying capacity about a stationary mean, window
+after window for the whole run. At `FoodRegrowTicks=400` that is a swing of about
+30–180 around a mean of 82. These survive the population floor; the starving
+remnants at slow regrowth do not.
 
 The **defaults sit at `FoodRegrowTicks=200`**, between the all-STABLE and mixed
 bands: a 1000-seed batch there is 966 STABLE, 33 TIMEOUT, 1 DECLINING, and
