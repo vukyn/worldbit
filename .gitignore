@@ -19,3 +19,6 @@ venv/
 runs*.csv
 out/
 runs*.config.json
+
+# Agent-local memory (never committed)
+.claude/
