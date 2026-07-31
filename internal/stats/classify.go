@@ -57,6 +57,26 @@ func (o Outcome) String() string {
 	}
 }
 
+// StopsRun reports whether an outcome ends the simulation early.
+//
+// Extinction and overrun do: nothing further can be learned from a world with
+// no agents, and an overrun run costs roughly thirteen times a normal one per
+// tick, which across a sweep is the difference between minutes and hours.
+//
+// STABLE is terminal for the classifier but deliberately does NOT stop the run.
+// FinalPop, FinalTick and StateHash describe the world where the simulation
+// stopped; cutting stable runs short at their third stable boundary would make
+// those three columns describe a different point in time for stable runs than
+// for every other kind.
+//
+// It lives here rather than in the batch harness because the viewer must stop
+// at exactly the same tick the harness did, or the replay hash it compares
+// against a recorded state_hash would be taken from a different moment and
+// every extinct run would report a spurious mismatch.
+func StopsRun(outcome Outcome) bool {
+	return outcome == OutcomeExtinct || outcome == OutcomeOverrun
+}
+
 // ClassifierConfig holds the thresholds the state machine resolves against.
 //
 // It is separate from sim.Config on purpose: this package never imports the

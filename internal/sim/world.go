@@ -199,6 +199,40 @@ func (w *World) Population() int32 { return int32(len(w.Agents)) }
 // Year is the elapsed simulated year, for reporting only.
 func (w *World) Year() int32 { return w.Tick / w.Cfg.TicksPerYear }
 
+// Clone returns an independent deep copy of the world.
+//
+// It exists for the viewer's backward scrub: keeping a handful of clones in
+// memory turns "jump back 500 ticks" into a short forward re-simulation from
+// the nearest earlier clone instead of a full replay from tick zero. It is a
+// pure optimisation of something the seed can always reproduce, never a
+// persisted format — nothing here is ever serialised.
+//
+// Stepping a clone produces exactly the trajectory stepping the original would
+// have produced: every canonical field is copied, and the two scratch buffers
+// are not canonical (intents is fully rewritten at the top of each tick and
+// births is emptied at the bottom of one), so starting them empty changes
+// nothing but their capacity.
+func (w *World) Clone() *World {
+	clone := *w
+
+	clone.Cells = make([]Cell, len(w.Cells))
+	copy(clone.Cells, w.Cells)
+
+	clone.Agents = make([]Agent, len(w.Agents), cap(w.Agents))
+	copy(clone.Agents, w.Agents)
+
+	clone.blockFood = make([]int32, len(w.blockFood))
+	copy(clone.blockFood, w.blockFood)
+
+	// Allocated on first use by Verify, and holding no state between calls.
+	clone.blockScratch = nil
+
+	clone.intents = make([]Intent, 0, cap(w.intents))
+	clone.births = make([]Birth, 0, cap(w.births))
+
+	return &clone
+}
+
 // WorldView is the read-only face of the world handed to the decide phase.
 //
 // It exposes value-returning accessors and no mutating methods at all, which

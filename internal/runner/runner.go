@@ -222,7 +222,7 @@ func runOne(opts Options, cell Cell, seed uint64) (Record, error) {
 			fmt.Fprintf(log, "seed=%d tick=%d hash=%016x\n", seed, world.Tick, sim.Hash(world))
 		}
 
-		if stopsRun(classifier.Outcome()) {
+		if stats.StopsRun(classifier.Outcome()) {
 			break
 		}
 	}
@@ -244,20 +244,4 @@ func runOne(opts Options, cell Cell, seed uint64) (Record, error) {
 		CellIndex:   cell.Index,
 		Axes:        cell.Axes,
 	}, nil
-}
-
-// stopsRun reports whether an outcome ends the simulation early.
-//
-// Extinction and overrun do: nothing further can be learned from a world with
-// no agents, and an overrun run costs roughly thirteen times a normal one per
-// tick, which across a sweep is the difference between minutes and hours.
-//
-// STABLE is terminal for the CLASSIFIER but deliberately does not stop the run.
-// FinalPop, FinalTick and StateHash describe the world where the simulation
-// stopped; cutting stable runs short at their third stable boundary would make
-// those three columns describe a different point in time for stable runs than
-// for every other kind, and would break replay verification, which re-simulates
-// to FinalTick and compares hashes.
-func stopsRun(outcome stats.Outcome) bool {
-	return outcome == stats.OutcomeExtinct || outcome == stats.OutcomeOverrun
 }

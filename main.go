@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/urfave/cli/v2"
@@ -18,6 +20,7 @@ import (
 	"github.com/vukyn/worldbit/internal/config"
 	"github.com/vukyn/worldbit/internal/runner"
 	"github.com/vukyn/worldbit/internal/sim"
+	"github.com/vukyn/worldbit/internal/stats"
 )
 
 // version is written into every output record, so a "same seed, different
@@ -111,7 +114,26 @@ func appFlags() []cli.Flag {
 			Usage: "GUI pixel scale (the grid is rendered at this many pixels per cell)",
 			Value: 4,
 		},
+		&cli.StringFlag{
+			Name:  "expect-hash",
+			Usage: "hex state_hash from a recorded run; the viewer checks its replay against it",
+		},
 	}
+}
+
+// guiRequest is everything the viewer needs.
+//
+// It lives in this file rather than in either build-tag variant so that both
+// runGUI implementations agree on the signature, and so that adding a viewer
+// option cannot silently break the headless build.
+type guiRequest struct {
+	Config     sim.Config
+	Seed       uint64
+	Scale      int
+	Classifier stats.ClassifierConfig
+	ExpectHash uint64
+	HasExpect  bool
+	Version    string
 }
 
 func run(c *cli.Context) error {
@@ -138,7 +160,42 @@ func run(c *cli.Context) error {
 	if c.Bool("headless") {
 		return runHeadless(c, cfg)
 	}
-	return runGUI(cfg, c.Uint64("seed"), c.Int("scale"))
+
+	expectHash, hasExpect, err := parseExpectHash(c.String("expect-hash"))
+	if err != nil {
+		return err
+	}
+
+	// The classifier thresholds are mapped here, by the one function the batch
+	// harness also uses. The viewer must not derive its own: a second mapping
+	// would eventually drift, and the symptom would be a run the CSV files
+	// under one outcome and the window labels with another.
+	return runGUI(guiRequest{
+		Config:     cfg,
+		Seed:       c.Uint64("seed"),
+		Scale:      c.Int("scale"),
+		Classifier: runner.ClassifierParams(cfg),
+		ExpectHash: expectHash,
+		HasExpect:  hasExpect,
+		Version:    version,
+	})
+}
+
+// parseExpectHash reads a recorded state_hash off the command line. An absent
+// value is not an expectation; a malformed one is an error, because silently
+// treating "0x3f9a" with a typo in it as "no expectation" would turn a failed
+// determinism check into a run that simply looked fine.
+func parseExpectHash(text string) (uint64, bool, error) {
+	if text == "" {
+		return 0, false, nil
+	}
+
+	digits := strings.TrimPrefix(strings.TrimPrefix(text, "0x"), "0X")
+	hash, err := strconv.ParseUint(digits, 16, 64)
+	if err != nil {
+		return 0, false, fmt.Errorf("--expect-hash %q is not a 64-bit hex state hash", text)
+	}
+	return hash, true, nil
 }
 
 // resolveConfig applies the resolution order: defaults, then the --config
