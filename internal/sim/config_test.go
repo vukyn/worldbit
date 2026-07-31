@@ -12,6 +12,20 @@ func TestDefaultConfigIsValid(t *testing.T) {
 	}
 }
 
+// TestClassificationKnobsAcceptZero pins the opt-out that both classification
+// parameters promise. Zero is not merely tolerated, it is the documented way to
+// disable each feature and reproduce the behaviour from before it existed, so a
+// stray move into the positive-values list would silently break that contract.
+func TestClassificationKnobsAcceptZero(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.BurnInWindows = 0
+	cfg.MinOscillatingPopulation = 0
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() rejected the opt-out values: %v", err)
+	}
+}
+
 // TestValidateRejects covers every rule whose violation would otherwise fail
 // silently and plausibly. MatureAge > MaxAge is the sharpest example: it makes
 // every run classify EXTINCT and reads exactly like an ecology bug.
@@ -41,6 +55,13 @@ func TestValidateRejects(t *testing.T) {
 		{"regrow ticks above max tick", "FoodRegrowTicks", func(c *Config) { c.MaxTick = 100 }},
 		{"more agents than cells", "InitAgents", func(c *Config) { c.InitAgents = 20000 }},
 		{"search radius above grid", "SearchRadius", func(c *Config) { c.SearchRadius = 200 }},
+		// The two classification knobs are checked outside the positive list,
+		// because zero is legal and meaningful for both. Only negatives are
+		// rejected.
+		{"negative burn-in windows", "BurnInWindows", func(c *Config) { c.BurnInWindows = -1 }},
+		{"negative oscillation floor", "MinOscillatingPopulation", func(c *Config) {
+			c.MinOscillatingPopulation = -1
+		}},
 	}
 
 	for _, testCase := range cases {

@@ -170,11 +170,41 @@ func (w Window) StableVariation() bool {
 //
 // A run that never settles is recognised by having had at least one such
 // window; see Classifier.Finish.
+//
+// This is the bare statistical predicate and says nothing about whether the
+// window is big enough for it to MEAN anything — the coefficient of variation
+// is scale-free, so a population wandering between 10 and 40 clears this line
+// far more easily than one wandering between 700 and 900. The population floor
+// that makes the answer meaningful is MeanAtLeast, applied alongside this by
+// the classifier; keeping the two separate leaves this function a pure
+// statement about the arithmetic, which is how the big.Rat reference test
+// checks it.
 func (w Window) HighVariation() bool {
 	if w.count < 1 || w.sumP <= 0 {
 		return false
 	}
 	return 16*w.count*w.sumPP > 17*w.sumP*w.sumP
+}
+
+// MeanAtLeast reports whether the window's mean population is at least floor.
+//
+//	S1/n >= floor  ⟺  S1 >= floor·n
+//
+// Multiplying through by n keeps the test exact in integers, with no division
+// and no new accumulator: S1 and n are already tracked. The largest term is
+// floor·n, bounded by MaxInt32·MaxWindowSize ≈ 8.8e12, comfortably inside
+// int64.
+//
+// The MEAN is the right population to test, rather than the sample at the
+// window's right edge that the stability floor uses: the coefficient of
+// variation is a property of the whole window, so the population it has to be
+// meaningful against is the one the window spent its time at.
+//
+// A floor of zero is always satisfied — populations are non-negative, so
+// S1 >= 0 holds for every window — which is what makes the floor provably
+// opt-out.
+func (w Window) MeanAtLeast(floor int) bool {
+	return w.sumP >= int64(floor)*w.count
 }
 
 // FlatSlope reports whether the window's trend, expressed as the fraction of

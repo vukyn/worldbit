@@ -53,6 +53,19 @@ type Config struct {
 	// See stats.ClassifierConfig.BurnInWindows for what it does. Zero opts out.
 	BurnInWindows int32 `json:"BurnInWindows"`
 
+	// MinOscillatingPopulation is a CLASSIFICATION parameter on the same
+	// footing as BurnInWindows: the simulation never reads it, it cannot move
+	// a state hash, and it lives here so that it travels in config_hash and can
+	// be swept by name.
+	//
+	// It is the mean population a window must reach before its coefficient of
+	// variation may count as high variation. Without it, the scale-free
+	// coefficient of variation labels any small starving remnant OSCILLATING.
+	//
+	// See stats.ClassifierConfig.MinOscillatingPopulation for the derivation of
+	// the default. Zero opts out.
+	MinOscillatingPopulation int32 `json:"MinOscillatingPopulation"`
+
 	Verify bool `json:"Verify"`
 }
 
@@ -90,7 +103,8 @@ func DefaultConfig() Config {
 		InitAgeSpread:   240,
 		SearchRadius:    12,
 
-		BurnInWindows: 1,
+		BurnInWindows:            1,
+		MinOscillatingPopulation: 64,
 
 		Verify: false,
 	}
@@ -143,10 +157,17 @@ func (c Config) Validate() error {
 		}
 	}
 
-	// Zero is legal and meaningful — it opts the classifier out of burn-in
-	// entirely — so this one is checked separately from the positive list.
+	// Zero is legal and meaningful for both of these — it opts the classifier
+	// out of burn-in and out of the high-variation floor respectively — so they
+	// are checked separately from the positive list.
 	if c.BurnInWindows < 0 {
 		return &ConfigError{Field: "BurnInWindows", Reason: "must not be negative (0 disables burn-in)"}
+	}
+	if c.MinOscillatingPopulation < 0 {
+		return &ConfigError{
+			Field:  "MinOscillatingPopulation",
+			Reason: "must not be negative (0 disables the high-variation population floor)",
+		}
 	}
 
 	// Torus masking (idx = (y<<shift)|x, wrap = &mask) requires powers of two,
@@ -231,6 +252,7 @@ func (c Config) Hash() uint64 {
 	hash = mixInt32(hash, c.InitAgeSpread)
 	hash = mixInt32(hash, c.SearchRadius)
 	hash = mixInt32(hash, c.BurnInWindows)
+	hash = mixInt32(hash, c.MinOscillatingPopulation)
 	hash = mixBool(hash, c.Verify)
 
 	return hash
