@@ -284,10 +284,34 @@ identical files once `wall_ms` is blanked.
 
 ## Status
 
-Phases 1–4 are done: the determinism harness, agents, the outcome classifier
-and the batch runner with parameter sweeps. The GUI (phase 5) is still a stub —
-`go run . --seed 1` reports that the viewer has not landed. `docs/plan.md` is
+Phases 1–5 are done: the determinism harness, agents, the outcome classifier,
+the batch runner with parameter sweeps, and the ebiten viewer. `go run . --seed 1`
+opens the viewer; `go run . --headless …` runs the batch harness. Note that a
+default build links ebiten, whose package `init()` needs a window server even in
+headless mode — on a server or in CI, build with `-tags nogui`. `docs/plan.md` is
 the full design.
+
+### How food regrows
+
+Each cell regrows one unit every `FoodRegrowTicks` ticks, but the board is
+**not** refilled all at once: `1/FoodRegrowTicks` of the cells regrow on each
+tick, so there is no synchronised global pulse stamping a sawtooth onto every
+run.
+
+Which cells regrow on a given tick is decided by striding over a **fixed
+permutation** of the cell indices, not over the indices themselves. Striding
+over raw indices gives the same workload and the same once-per-period coverage,
+but the index runs along x first, so horizontally adjacent cells regrow one tick
+apart and recovery sweeps the grid as a travelling front — visible in the viewer
+as long horizontal streaks of food with the agents banded up behind them. The
+permutation keeps the coverage and drops the spatial correlation. See
+`buildRegrowOrder` in `internal/sim/env.go`, and "Experimental findings" item 6
+in `docs/plan.md` for the before/after measurements.
+
+The permutation is a constant of the simulator rather than seed-derived: the
+seed-derived variant was measured and adds no seed-to-seed variance whatsoever,
+while a constant one is the permutation every run uses and can therefore be
+pinned by a single test.
 
 ### What the parameters actually do
 
@@ -295,6 +319,12 @@ Mapped by a 45-cell sweep over `InitFoodPerCell` × `ReproEnergyCost` ×
 `FoodRegrowTicks`, 20 seeds per cell. `FoodRegrowTicks` dominates, because it
 sets the carrying capacity (`cells / FoodRegrowTicks × EnergyPerFood /
 BurnPerTick`); the other two mostly move the height of the opening boom:
+
+> ⚠️ The outcome distributions in this section were measured **before** the
+> regrowth-permutation fix and are not comparable to anything measured after it.
+> The capacity column is unaffected (capacity was confirmed unchanged by
+> measurement); the outcome mixes moved substantially. `docs/plan.md`
+> "Experimental findings" item 6 has the re-measured grid.
 
 | `FoodRegrowTicks` | Capacity | Outcome |
 |---|---|---|
@@ -316,7 +346,8 @@ after window for the whole run. At `FoodRegrowTicks=400` that is a swing of abou
 remnants at slow regrowth do not.
 
 The **defaults sit at `FoodRegrowTicks=200`**, between the all-STABLE and mixed
-bands: a 1000-seed batch there is 966 STABLE, 33 TIMEOUT, 1 DECLINING, and
-EXTINCT / OVERRUN / OSCILLATING are unreachable. That is a deliberately quiet
-region, which is what makes it a good baseline — but a sweep, not a seed batch,
-is the way to exercise the classifier.
+bands. A 1000-seed batch there is now **1000 STABLE** — before the
+regrowth-permutation fix it was 966 STABLE, 33 TIMEOUT and 1 DECLINING. That is
+a deliberately quiet region, which is what makes it a good baseline, but it is
+now silent enough that **a seed batch at the defaults cannot exercise the
+classifier at all**. Use a sweep.

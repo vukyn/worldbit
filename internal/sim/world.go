@@ -45,6 +45,13 @@ type World struct {
 	xMask  int32 // Width-1
 	yMask  int32 // Height-1
 
+	// regrowOrder is a permutation of every cell index, built once at
+	// construction and never mutated afterwards. Phase 1 strides over
+	// POSITIONS in it rather than over cell indices, which is what keeps
+	// regrowth from sweeping the board as a travelling front. It does not
+	// depend on the seed — see buildRegrowOrder for why not.
+	regrowOrder []int32
+
 	// Coarse food index: total food per block of cells. Maintained
 	// incrementally by regrowth and eating, rebuilt-and-compared under Verify.
 	blockFood     []int32
@@ -108,6 +115,8 @@ func NewWorld(seed uint64, cfg Config) *World {
 		world.Cells[i].Biome = BiomePlain
 		world.Cells[i].Food = cfg.InitFoodPerCell
 	}
+
+	world.regrowOrder = buildRegrowOrder(int32(cellCount))
 
 	world.initBlockIndex()
 	world.seedAgents()
@@ -223,6 +232,11 @@ func (w *World) Clone() *World {
 
 	clone.blockFood = make([]int32, len(w.blockFood))
 	copy(clone.blockFood, w.blockFood)
+
+	// regrowOrder is shared, not copied. It is immutable after construction and
+	// depends only on the cell count, which a clone shares with its original,
+	// so a copy would be 64 KB per snapshot holding the same bytes. Anything
+	// that ever writes to it must copy it here first.
 
 	// Allocated on first use by Verify, and holding no state between calls.
 	clone.blockScratch = nil

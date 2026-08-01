@@ -21,11 +21,126 @@ func emptyWorld(t *testing.T, cfg Config) *World {
 	return world
 }
 
+// regrowPositions inverts the regrowth permutation: positionOf[cellIndex] is
+// the position in regrowOrder the stride reaches that cell at.
+//
+// Inverting it also checks it: a slice that is not a permutation leaves a
+// position unwritten or writes one twice, and both are caught here rather than
+// showing up later as a coverage test that fails for an unrelated-looking
+// reason.
+func regrowPositions(t *testing.T, world *World) []int32 {
+	t.Helper()
+
+	cellCount := int32(len(world.Cells))
+	if int32(len(world.regrowOrder)) != cellCount {
+		t.Fatalf("regrowOrder has %d entries, want one per cell (%d)", len(world.regrowOrder), cellCount)
+	}
+
+	positionOf := make([]int32, cellCount)
+	for i := range positionOf {
+		positionOf[i] = -1
+	}
+
+	for position, index := range world.regrowOrder {
+		if index < 0 || index >= cellCount {
+			t.Fatalf("regrowOrder position %d holds cell %d, out of range", position, index)
+		}
+		if positionOf[index] != -1 {
+			t.Fatalf("cell %d appears at regrowth positions %d and %d — not a permutation",
+				index, positionOf[index], position)
+		}
+		positionOf[index] = int32(position)
+	}
+
+	return positionOf
+}
+
+// TestRegrowthOrderIsSpatiallyIncoherent is the assertion the permutation was
+// added for, and the one a plain index stride fails outright.
+//
+// Striding over raw indices makes regrowth time an affine function of position:
+// horizontally adjacent cells regrow exactly one tick apart, so every one of the
+// 16384 horizontal neighbour pairs has a regrowth-position gap of 1 and the
+// board recovers behind a travelling front. Under a uniform random permutation
+// the expected number of adjacent pairs landing one position apart is about 2
+// per direction, so the bound below is loose by orders of magnitude in the
+// direction that matters: it cannot pass for anything with structure in it.
+func TestRegrowthOrderIsSpatiallyIncoherent(t *testing.T) {
+	cfg := DefaultConfig()
+	world := emptyWorld(t, cfg)
+	positionOf := regrowPositions(t, world)
+
+	// A hundredth of the board. A travelling front scores 16384 here; chance
+	// scores single digits.
+	limit := int32(len(world.Cells)) / 100
+
+	for _, direction := range []struct {
+		name   string
+		deltaX int32
+		deltaY int32
+	}{
+		{name: "horizontal", deltaX: 1},
+		{name: "vertical", deltaY: 1},
+	} {
+		consecutive := int32(0)
+		for y := int32(0); y < cfg.Height; y++ {
+			for x := int32(0); x < cfg.Width; x++ {
+				here := world.cellIdx(uint8(x), uint8(y))
+				there := world.cellIdx(world.wrapX(x+direction.deltaX), world.wrapY(y+direction.deltaY))
+
+				gap := positionOf[here] - positionOf[there]
+				if gap == 1 || gap == -1 {
+					consecutive++
+				}
+			}
+		}
+
+		if consecutive > limit {
+			t.Errorf("%d of %d %s neighbour pairs regrow one tick apart (limit %d) — regrowth is "+
+				"sweeping the board as a travelling front, which is the artefact the permutation removes",
+				consecutive, len(world.Cells), direction.name, limit)
+		}
+	}
+}
+
+// TestRegrowthOrderDoesNotDependOnTheSeed pins the half of the design that makes
+// TestRegrowthOrderIsSpatiallyIncoherent worth anything.
+//
+// The permutation is a constant of the simulator, so the incoherence test above
+// checks the exact schedule every run will ever use rather than sampling one
+// seed's draw. If this ever starts failing, that test has quietly turned into a
+// spot check.
+func TestRegrowthOrderDoesNotDependOnTheSeed(t *testing.T) {
+	cfg := DefaultConfig()
+	reference := NewWorld(1, cfg)
+
+	for _, seed := range []uint64{0, 2, 7, 12345, 1 << 63} {
+		other := NewWorld(seed, cfg)
+		for i := range reference.regrowOrder {
+			if reference.regrowOrder[i] != other.regrowOrder[i] {
+				t.Fatalf("seeds 1 and %d disagree on regrowth position %d (%d vs %d) — the "+
+					"permutation must not depend on the seed", seed, i,
+					reference.regrowOrder[i], other.regrowOrder[i])
+			}
+		}
+	}
+
+	// A different grid size is a different permutation, and must still be one.
+	small := cfg
+	small.Width, small.Height = 16, 16
+	small.SearchRadius = 8
+	regrowPositions(t, NewWorld(1, small))
+}
+
 // TestRegrowthStrideCoversEachCellExactlyOnce pins the stride scheme: over one
 // full FoodRegrowTicks period every cell regrows exactly once, and no tick
 // touches a cell twice. A synchronised global pulse would pass a naive
 // "food goes up" test while stamping a sawtooth on every run, so the assertion
 // is per-cell and per-tick, not aggregate.
+//
+// The stride now runs over positions in the regrowth permutation rather than
+// over cell indices, so the per-tick assertion is on the cell's POSITION. The
+// coverage guarantee is unchanged and is exactly what a permutation preserves.
 func TestRegrowthStrideCoversEachCellExactlyOnce(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.FoodMax = 100 // high enough that no cell can saturate during the period
@@ -34,6 +149,7 @@ func TestRegrowthStrideCoversEachCellExactlyOnce(t *testing.T) {
 	world := emptyWorld(t, cfg)
 	cellCount := int32(len(world.Cells))
 	stride := cfg.FoodRegrowTicks
+	positionOf := regrowPositions(t, world)
 
 	regrowCount := make([]int, cellCount)
 	before := make([]int16, cellCount)
@@ -59,8 +175,9 @@ func TestRegrowthStrideCoversEachCellExactlyOnce(t *testing.T) {
 			case 1:
 				changed++
 				regrowCount[i]++
-				if int32(i)%stride != tick {
-					t.Fatalf("tick %d regrew cell %d, which is not on the stride", tick, i)
+				if positionOf[i]%stride != tick {
+					t.Fatalf("tick %d regrew cell %d (regrowth position %d), which is not on the stride",
+						tick, i, positionOf[i])
 				}
 			default:
 				t.Fatalf("tick %d changed cell %d by %d, expected 0 or 1", tick, i, delta)

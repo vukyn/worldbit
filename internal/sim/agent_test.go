@@ -196,9 +196,11 @@ func TestEatIsRecheckedAtResolveTime(t *testing.T) {
 	clearFood(world)
 
 	// A cell the tick-0 regrowth stride does not touch, so the scenario is
-	// exactly one food unit for two agents.
+	// exactly one food unit for two agents. The stride walks positions in the
+	// seed's regrowth permutation, so "on the stride" is a property of the
+	// cell's position in that permutation, not of its index.
 	const shared = int32(1291)
-	if shared%cfg.FoodRegrowTicks == 0 {
+	if regrowPositions(t, world)[shared]%cfg.FoodRegrowTicks == 0 {
 		t.Fatalf("cell %d is on the tick-0 regrowth stride — pick another", shared)
 	}
 	world.Cells[shared].Food = 1
