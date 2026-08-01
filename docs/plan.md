@@ -76,7 +76,7 @@ internal/sim/                    # PURE. stdlib only.
   world.go                       # World, Cell, Agent, WorldView; NewWorld(seed, cfg)
   rng.go                         # splitmix64, AgentRand, Intn (Lemire, integer-only)
   tick.go                        # Step(w): six ordered phases
-  env.go                         # regrowth stride, torus index helpers
+  env.go                         # regrowth stride + permutation, torus index helpers
   index.go                       # coarse 16x16 block food index (derived, NOT hashed)
   agent.go                       # decide() -> Intent; findNearestFood; stepToward
   intent.go
@@ -337,7 +337,15 @@ func Step(w *World):
   # Stride regrowth: exactly ceil(N/200) cells per tick, each cell regrowing once
   # per 200 ticks. NOT "all cells every 200 ticks" — a synchronised global pulse
   # would create a 200-tick sawtooth artefact in every run.
-  for i := int32(w.Tick % Cfg.FoodRegrowTicks); i < len(Cells); i += Cfg.FoodRegrowTicks:
+  #
+  # The stride walks POSITIONS IN regrowOrder, a fixed permutation of the cell
+  # indices built once at construction. Striding over raw indices gives the same
+  # workload and the same coverage but makes regrowth time an affine function of
+  # board position — index runs along x first, so neighbours regrow one tick
+  # apart and recovery sweeps the grid as a travelling horizontal front. See
+  # "Experimental findings" item 6.
+  for p := int32(w.Tick % Cfg.FoodRegrowTicks); p < len(Cells); p += Cfg.FoodRegrowTicks:
+      i := regrowOrder[p]
       if Cells[i].Biome != BiomeWater && Cells[i].Food < Cfg.FoodMax:
           Cells[i].Food++ ; blockFood[blockOf(i)]++
 
@@ -591,14 +599,14 @@ Determinism harness precedes gameplay throughout. Each phase ends green on `go t
 2b. Config loading in `main`/`internal/config`: `--config` file, `--set` overrides, `--dump-config`; resolution order default → file → flags; `Validate()` before anything runs. Tests: `TestConfigRoundTrip`, `TestPartialConfigKeepsDefaults`, `TestValidateRejects`, `TestConfigHashChangesWithEveryField`.
 3. `world.go` — `Cell`, `Agent`, `World`, `WorldView`, `NewWorld(seed, cfg)` creating cells only (`InitFoodPerCell`, all `BiomePlain`), zero agents.
 4. `rng.go` — splitmix64, `AgentRand`, `Rand.Next`, `Rand.Intn`.
-5. `env.go` — torus index helpers, stride regrowth.
+5. `env.go` — torus index helpers, stride regrowth over the `regrowOrder` permutation (see "Experimental findings" item 6).
 6. `tick.go` — `Step` with phase 1 and the tick increment only.
 7. `hash.go` — inlined FNV-1a canonical hash.
 8. **`determinism_lint_test.go`** — the AST guard. Write this before anything else in `sim` grows.
 9. **`TestSameSeedSameHash`** over 12 000 ticks, checkpoint every 100.
 10. **`TestGoldenHashes`** + `-update` machinery + committed `testdata/golden_hashes.csv`.
 11. `TestSubstreamIndependence` — agent 7's draw sequence identical whether or not agent 5 exists.
-12. `TestRegrowthStrideCoversEachCellExactlyOnce` over 200 ticks; `TestFoodNeverExceedsMaxOrGoesNegative`.
+12. `TestRegrowthStrideCoversEachCellExactlyOnce` over 200 ticks; `TestFoodNeverExceedsMaxOrGoesNegative`; `TestRegrowthOrderIsSpatiallyIncoherent` and `TestRegrowthOrderDoesNotDependOnTheSeed`.
 13. `main.go` with the full flag set, both modes stubbed; `gui_stub.go` + `gui_enabled.go` (empty stub for now) — prove `-tags nogui` builds.
 
 *Exit: a world with no agents is hash-stable across runs and pinned by golden fixtures, and the lint test rejects a deliberately introduced `map[int]int` in `sim`.*
@@ -691,6 +699,8 @@ The aggregate is what actually answers "which parameter region is interesting"; 
 
 The first real results the harness has produced. Recorded here because they are what P5 and P6 will be reasoned from, and because two of them are corrections to assumptions in this plan.
 
+> ⚠️ **Every number in items 1–5 below predates the regrowth-permutation fix (item 6, 2026-08-01) and is NOT comparable to anything measured after it.** The fix changes the trajectory of every run at every parameter setting. Items 1–5 are kept verbatim as the record of what was measured and when — do not silently place a post-fix figure next to one of them. Item 6 carries the re-measured grid. The carrying-capacity *arithmetic* in item 1 is unaffected, and was confirmed unchanged by measurement; the outcome *distributions* moved substantially.
+
 Method: a 45-cell sweep over `InitFoodPerCell` [1,3,5] × `ReproEnergyCost` [30,40,50] × `FoodRegrowTicks` [25,100,400,1600,6400], 20 seeds per cell (900 runs, 37 s), plus a 12-cell `BurnPerTick` × `FoodRegrowTicks` grid and a 6-cell probe of the near-overrun band.
 
 **1. `FoodRegrowTicks` dominates; it is the carrying-capacity knob.** Capacity is `cells / FoodRegrowTicks × EnergyPerFood / BurnPerTick`, and the outcome follows it almost deterministically:
@@ -728,6 +738,37 @@ Method: a 45-cell sweep over `InitFoodPerCell` [1,3,5] × `ReproEnergyCost` [30,
 
 **5. The ratified defaults sit in a deliberately quiet region.** At `FoodRegrowTicks=200`, between the all-STABLE and mixed bands, a 1000-seed batch is 966 STABLE / 33 TIMEOUT / 1 DECLINING, with EXTINCT, OVERRUN and OSCILLATING unreachable and the peak at year 6 in all eight golden seeds. Moving `FoodRegrowTicks` one notch changes the distribution more than 1000 seeds do. **The defaults were not retuned** — they are the user's, and this map is the evidence for that decision rather than a licence to make it. Note for anyone exercising the classifier: use a sweep, not a seed batch. `FoodRegrowTicks` 300–500 is where STABLE, TIMEOUT and DECLINING coexist inside one cell.
 
+**6. Regrowth swept the board as a travelling front, and no statistic in the harness could see it.** Found at P5 by watching the viewer, not by reading a CSV: food appeared in long horizontal streaks and agents banded up behind them. `regrow` strode over raw cell indices, `for index := w.Tick % stride; index < cellCount; index += stride`, and the index runs along x first — so horizontally adjacent cells regrew exactly one tick apart and recovery moved across the grid as a front. The stride's own stated purpose (avoid a synchronised global *pulse*) was met; the spatial correlation was an unintended second consequence of the same line.
+
+> **RATIFIED AND FIXED (2026-08-01).** The stride now walks positions in `regrowOrder`, a permutation of the cell indices built once at construction by Fisher–Yates over the positional stream. Every cell still regrows exactly once per `FoodRegrowTicks` and the per-tick workload is identical; cells adjacent in space are no longer adjacent in regrowth time. Golden hashes were regenerated — this is a behavioural change, not a refactor. `TestRegrowthOrderIsSpatiallyIncoherent` pins the property.
+>
+> **The permutation is fixed, not seed-derived, and that was decided by measurement.** The seed-derived variant was expected to introduce the seed-to-seed variance this project has lacked. It introduces none. Over 1000 seeds at the defaults the two are indistinguishable — final-population variance ratio 1.0028 and peak-population ratio 0.9882, both dead centre of the ≈0.88–1.14 null band for F(999,999) — and across the 1200-run grid they differ only by ordinary seed noise (STABLE 507 vs 512, EXTINCT 189 vs 200, OSCILLATING 108 vs 101). Neither is simpler: grid size is a config parameter, so a fixed table still cannot be built once in `init()`, and the two versions differ by which `uint64` seeds the shuffle. The tiebreak is testability — one constant permutation is *the* permutation every run will ever use, so the incoherence test pins it for all of them instead of sampling one seed's draw. Seed-derived environmental structure is what P6's biome generation is for.
+>
+> **Seed variance did not increase. It more than halved — and the travelling front was the thing producing it.** Over 1000 seeds at the defaults, final population went from mean 770.0 / SD 44.9 (CV 5.83 %) to mean 769.0 / SD 19.2 (CV 2.50 %). The old spread was largely the phase relationship between the sweeping front and wherever the agents happened to be; with regrowth spatially neutral, that lever is gone. The eight golden seeds show the same collapse: finals were 696–820 spread over 124, now 739–787 spread over 48, and the lone DECLINING (seed 5) is now STABLE like the rest.
+>
+> **Carrying capacity is unchanged, exactly as theory says it must be** — total food production per tick is identical. Mean final population at `BurnPerTick=1` barely moves anywhere on the `FoodRegrowTicks` axis: 6584→6578 at 25, 1540→1546 at 100, 385→386 at 400, 302→302 at 500, 184→188 at 800, 90→94 at 1600. The **STABLE/OVERRUN boundary does not move at all**: OVERRUN is 20/20 at `FoodRegrowTicks=25` / `BurnPerTick=1` and zero in all 59 other cells, before and after.
+>
+> **What did move is convergence, and it moved a lot.** On the 12 × 5 grid (`FoodRegrowTicks` [25, 100, 200, 300, 400, 500, 600, 800, 1600, 2000, 3200, 6400] × `BurnPerTick` [1–5], 20 seeds, 1200 runs):
+>
+> | Outcome | Before | After |
+> |---|---|---|
+> | EXTINCT | 137 | 189 |
+> | STABLE | 310 | 507 |
+> | OSCILLATING | 109 | 108 |
+> | OVERRUN | 20 | 20 |
+> | DECLINING | 140 | 74 |
+> | TIMEOUT | 484 | 302 |
+>
+> The +197 STABLE is almost entirely TIMEOUT converting in the `FoodRegrowTicks` 300–800 / `BurnPerTick` 1–3 band (400/1 goes 4→20 STABLE, 500/1 1→20, 800/1 0→20). Populations there already sat at the capacity the arithmetic predicts; they simply never held still long enough for three consecutive windows to satisfy the stable predicate, because the front kept perturbing them. **So the front was doing more ecological work than anyone realised — not to the capacity, but to the stationarity.** That is worth knowing on its own: a large part of what the harness was filing as TIMEOUT was an artefact of the regrowth schedule.
+>
+> **The genuine-oscillation region survives.** `BurnPerTick=5` with `FoodRegrowTicks` 300/400/500/600 is still 20/20 OSCILLATING in every cell. The region's edges shifted rather than its core: it now extends down to `FoodRegrowTicks=200` (7→12 of 20) and weakens at 800 (10→6), where the cell is tipping into extinction instead (EXTINCT 7→12). A new pocket appears at 600/`BurnPerTick=4` (1→9). Total OSCILLATING is essentially flat, 109→108.
+>
+> **What got worse — foraging at the margin.** A permutation scatters food into isolated single cells where the front left contiguous streaks, and a streak is easier to forage: an agent that finds one edge of it is standing next to more. At the harsh corner of the grid that difference is fatal. EXTINCT rises from 137 to 189, concentrated where supply was already marginal: 3200/`burn=4` 6→20, 2000/`burn=4` 0→18, 3200/`burn=3` 1→12, 1600/`burn=4` 0→7, 800/`burn=5` 7→12, 6400/`burn=3` 12→20. (One cell moves the other way, 6400/`burn=2` 11→0.) At the defaults the same effect is small but real and in the same direction: mean final population 770.0 → 769.0 over 1000 seeds, and 780.5 → 763.9 (−2.1 %) in the 20-seed grid cell. This is a genuine ecological cost of the fix, not noise, and it is the price of removing the artefact.
+>
+> **A second cost: the defaults got quieter still.** The 1000-seed default batch was 966 STABLE / 33 TIMEOUT / 1 DECLINING; it is now **1000 STABLE**. Item 5 called the defaults a deliberately quiet region — they are now a silent one, with no outcome variety at any seed. The eight golden seeds no longer contain a single non-STABLE run, which makes the default-parameter seed batch a materially weaker fixture (`goldenSeedOutcomesWithoutTheFloor` in `internal/runner/variation_floor_test.go` says so at the site). Item 5's advice becomes mandatory rather than a note: **exercise the classifier with a sweep, never with a seed batch at the defaults.**
+>
+> **The grid used here is recorded so it stops being unreproducible.** `sweep*.json` and `runs*.csv` are gitignored, so P4's exact grid was never recoverable and the reconstruction above is a near-miss of it, not the same file (it reproduces P4's STABLE 310 and OVERRUN 20 exactly, but not its EXTINCT 156 / OSCILLATING 87). Since the pre-fix numbers are not comparable anyway, the axis lists quoted in the table above are now the canonical grid; re-run it as a `--sweep` file with those two axes, `"seeds": 20`, `"seed_start": 1`.
+
 ---
 
 ## Migrations
@@ -741,13 +782,14 @@ Method: a 45-cell sweep over `InitFoodPerCell` [1,3,5] × `ReproEnergyCost` [30,
 `go test ./...` is the whole gate — no service to boot, no DB to seed.
 
 - **Determinism (P1, first):** `TestDeterminismLint`, `TestSameSeedSameHash`, `TestGoldenHashes`, `TestSubstreamIndependence`.
-- **Sim invariants (P2):** ascending IDs, energy/food/age bounds, block index equals rebuild, energy conservation per tick, regrowth stride coverage, `TestDeepRunNoOverflow` at 120 000 ticks.
+- **Sim invariants (P2):** ascending IDs, energy/food/age bounds, block index equals rebuild, energy conservation per tick, regrowth stride coverage (asserted on the cell's POSITION in the permutation), `TestDeepRunNoOverflow` at 120 000 ticks.
+- **Regrowth spatial neutrality (post-P5):** the permutation is a permutation; no more than 1 % of horizontally or vertically adjacent cell pairs regrow one tick apart (an index stride scores 100 %); the permutation does not vary with the seed, so the incoherence assertion covers every run rather than one seed's draw.
 - **Numerics (P3):** integer predicates vs `big.Rat`; classifier vs hand-built series for all six outcomes; `Rand.Intn` bucket uniformity.
 - **Runner (P4):** parallel output identical to serial apart from `wall_ms` (in both CSV and JSON); sorted by cell then seed; early stop does not change the verdict; `config_hash` present, per-row, and stable.
 - **Sweeps (P4):** grid expansion and axis ordering; unknown axis key and unusable axis value rejected at load; invalid cell skipped while the rest run; every-cell-invalid is an error; cell aggregation checked against hand-built records; sweep output identical across worker counts for both the per-run file and the aggregate.
 - **Burn-in (P4):** a wild opening followed by a flat tail classifies STABLE; `BurnInWindows=0` reproduces the old behaviour with hard-coded expectations; a burn-in longer than the run yields TIMEOUT without panicking; each of the three predicates is separately shown to respect it; EXTINCT and OVERRUN still fire inside burn-in.
 - **High-variation population floor (post-P4):** a large-amplitude cycle at high population still classifies OSCILLATING while a small noisy remnant does not, and lands on TIMEOUT or DECLINING via the existing fallback; the boundary is exercised at exactly the floor, one below and one above; `MinOscillatingPopulation=0` reproduces the pre-floor behaviour with hard-coded expectations both on hand-built series and on the real simulation (golden seeds 1–8 plus a 36-run `FoodRegrowTicks` × `BurnPerTick` grid chosen to contain both a cell that must change and a cell that must not); a negative floor panics. **No existing classifier or burn-in test needed changing** — the pre-existing OSCILLATING series all swing about a mean of 1000, far above any plausible floor, which is itself evidence that the floor targets the right thing.
-- **GUI (P5):** `TestGUINeverMutates`. Rest verified manually.
+- **GUI (P5):** `TestGUINeverMutates`. Rest verified manually — and the manual pass is what caught the travelling-front regrowth artefact that no statistic in the harness could see ("Experimental findings" item 6).
 - **Performance guards:** `BenchmarkStep`, `BenchmarkRun12000`, documented target ≈1 s per 12 000-tick run. Watch in review, not a hard failure.
 
 **Measured at P4** (default parameters, 12 000 ticks, arm64):

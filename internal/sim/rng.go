@@ -14,6 +14,11 @@ const (
 	purposeTiebreak = 2
 	purposeSpawnPos = 3
 	purposeInitAge  = 4
+	// purposeRegrowOrder is drawn once per world, not once per agent: it seeds
+	// the Fisher-Yates shuffle behind the regrowth permutation. It is on the
+	// same numbering as the agent purposes because it uses the same stream
+	// machinery, with agent id 0 — an id no agent ever has.
+	purposeRegrowOrder = 5
 )
 
 const (
