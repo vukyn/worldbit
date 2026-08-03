@@ -156,10 +156,12 @@ type Config struct {
 
     // Classification, not simulation: the sim never reads these and they
     // cannot move a state hash. They live here so they travel in config_hash
-    // and so a sweep can address them by field name. 0 disables each. See the
-    // classifier section.
+    // and so a sweep can address them by field name. See the classifier
+    // section. Each has a documented opt-out value: 0 for the two floors,
+    // and 1 — not 0 — for MinOscillatingWindows, which counts windows.
     BurnInWindows            int32  // 1
     MinOscillatingPopulation int32  // 64
+    MinOscillatingWindows    int32  // 2
 
     Verify          bool
 }
@@ -451,12 +453,12 @@ on each 1200-tick boundary:
     evaluate cv and slope predicates over the just-closed window
     if stable-predicate && pop >= 20 -> stableStreak++ ; if streak == 3 -> STABLE, terminal
     else                             -> stableStreak = 0
-    if cv > 0.25 && windowMean >= MinOscillatingPopulation -> sawHighVariation = true
+    if cv > 0.25 && windowMean >= MinOscillatingPopulation -> highVariationWindows++
     lastSlope = slope of this window
 at MAX_TICK:
-    if sawHighVariation                   -> OSCILLATING
-    elif lastSlope < -0.10 per window     -> DECLINING
-    else                                  -> TIMEOUT
+    if highVariationWindows >= MinOscillatingWindows -> OSCILLATING
+    elif lastSlope < -0.10 per window                -> DECLINING
+    else                                             -> TIMEOUT
 ```
 
 **Burn-in (`BurnInWindows`, default 1) — ratified after P3, and it changes what OSCILLATING means.**
@@ -512,6 +514,49 @@ Scored against an independent label for *sustained non-noise variation about a s
 **An absolute amplitude floor was measured and deliberately NOT added.** At floor 64 the window amplitude (`max − min`) of correctly-labelled runs (median 136) and of the remaining false positives (median 145) overlap almost exactly — the false positives are *larger*. Adding an amplitude floor of 100 moves F1 from 0.787 to 0.811 by trading recall for precision, which is curve-fitting, not signal, and it would cost two new per-tick accumulators. Not worth state that earns nothing.
 
 **What it does not fix.** 26 false positives survive at floor 64, all at high population (qualifying window means 65–172) and 19 of the 26 resting on a *single* firing window — one transient excursion latching the flag for the whole run. That is a different defect (a "how many windows" rule, not a population rule) and is left open deliberately.
+
+> **RATIFIED AND FIXED (2026-08-03)** by `MinOscillatingWindows`, below. The "19 of 26" count above predates the regrowth-permutation fix; re-measured after it, the figure is **30 of 108**.
+
+**Sustained oscillation (`MinOscillatingWindows`, default 2) — ratified after P5, and it changes what OSCILLATING means a third time.**
+
+Burn-in fixed the startup transient latching the flag. The population floor fixed small-number noise clearing a scale-free predicate. Neither answered *how many windows a run needs*, so the flag still **latched**: one window clearing both gates settled the verdict for the whole run. STABLE has always had to earn its verdict over three consecutive windows; OSCILLATING earned it on a single sample.
+
+Re-measured on the 1200-run `FoodRegrowTicks` × `BurnPerTick` grid **after** the regrowth-permutation fix (all 108 OSCILLATING runs go the full distance, so all have exactly 9 evaluable windows and the counts are directly comparable):
+
+| firing windows | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |
+|---|---|---|---|---|---|---|---|---|---|
+| runs | **30** | 13 | 8 | 5 | 8 | 11 | 10 | 5 | 18 |
+
+The rule: a run may resolve OSCILLATING only if at least `MinOscillatingWindows` post-burn-in windows cleared the high-variation predicate.
+
+- The count is the **total** number of firing windows, **not** a consecutive streak — the one place this rule deliberately departs from the `StableWindows` streak it otherwise mirrors. See "consecutive vs total" below.
+- It costs **no new state**: the `sawHighVariation` bool becomes an `int`.
+- It applies to the high-variation flag **only**, like the population floor and unlike burn-in, and the two gates on that flag are ANDed **per window** — a window below `MinOscillatingPopulation` does not count towards the threshold.
+- It is consulted only in `Finish`, so it cannot touch EXTINCT, OVERRUN or STABLE. Measured: those three are bit-for-bit unchanged across the whole grid.
+- `MinOscillatingWindows = 1` reproduces the latching behaviour **exactly** — "at least one window fired" is the latch. Note the opt-out value is **1, not 0**, breaking the pattern the two floors set: zero would satisfy "at least zero fired" for every run and make OSCILLATING the universal fallback, so `Validate()` and `NewClassifier` both reject it.
+
+**Choosing 2.** Chosen against the *shape* of the distribution above, not tuned to an outcome count. The bucket at one window holds 28 % of all OSCILLATING runs — more than twice the next bucket, and the mode of an otherwise U-shaped distribution. That spike is the latch signature and it is the only feature worth cutting at: the buckets at 2, 3 and 4 are flat and small, so a higher threshold buys no further separation and starts costing genuine cycles instead. Two is the smallest threshold that removes the spike.
+
+Three whole sweep cells confirm this at the cell level, independently of any statistic: `FoodRegrowTicks=600`/`BurnPerTick=4` (9 runs), `800`/`3` (1) and `200`/`5` (10 of 12) exist as OSCILLATING **only** as single-window runs, and their smoothed trajectories make 0–4 large excursions across the whole run. They are not cycles by any reading.
+
+Scored against an independent label — large excursions counted off the smoothed 100-tick-block series, which knows nothing about the 1200-tick window grid — two is also the best candidate, with 12 disagreements out of 108 against 15 for three and 23 for four.
+
+**Consecutive vs total.** A consecutive rule was the a-priori choice, since it is what `StableWindows` does, and it was rejected on measurement. The problem is that it **interacts with the population floor**: a cycle whose mean sits near `MinOscillatingPopulation` fails the *floor* in its trough windows, so every trough resets the streak and a genuine cycle can never build one. The cell `FoodRegrowTicks=600`/`BurnPerTick=5` is exactly that — 13–15 large excursions per run about a stationary mean, at a mean population of 52–56 against a floor of 64. It keeps **18 of 20** runs under a total rule of 2 and **4 of 20** under a consecutive rule of 2; a consecutive rule of 3 empties it entirely. Requiring adjacency would make the verdict depend on where a cycle happens to sit relative to a *different* threshold, which is not what "sustained" is meant to mean.
+
+**Measured effect** on the same 1200-run grid. OSCILLATING falls from 108 to 78; every one of the 30 removed runs had exactly one firing window, and every one landed in the existing fallback order:
+
+| Outcome | Before | After |
+|---|---|---|
+| EXTINCT | 189 | 189 |
+| STABLE | 507 | 507 |
+| OSCILLATING | 108 | **78** |
+| OVERRUN | 20 | 20 |
+| DECLINING | 74 | **81** |
+| TIMEOUT | 302 | **325** |
+
+The genuine-cycle region (`BurnPerTick=5`, `FoodRegrowTicks` 300–600) keeps **75 of its 80** runs: 400/5 and 500/5 are untouched at 20/20, 600/5 goes to 18/20 and 300/5 to 17/20. The eight golden seeds and the default parameters are unaffected, because they all resolve STABLE and never reach the fallback.
+
+**`StableWindows` was deliberately NOT lifted into `sim.Config` alongside it.** The symmetry argument is real — the two knobs now count windows for opposite verdicts — but the classifier's original spec constants (`WindowTicks`, `StableWindows`, `MinStablePopulation`) all live in `stats.ClassifierConfig` alone, and only the knobs that were the subject of a later design decision (`BurnInWindows`, `MinOscillatingPopulation`, now `MinOscillatingWindows`) have been lifted into `sim.Config` so they travel in `config_hash` and can be swept. Lifting `StableWindows` would make the stable side sweepable, which is a separate and defensible change; doing it silently inside an oscillation fix is not. It is noted here rather than done.
 
 **Record** — one row per run, fixed CSV column order, LF endings, hash as `%016x`:
 
@@ -736,6 +781,16 @@ Method: a 45-cell sweep over `InitFoodPerCell` [1,3,5] × `ReproEnergyCost` [30,
 >
 > Still open, and NOT addressed by the floor: 26 of the 87 surviving OSCILLATING runs are high-population runs (qualifying window means 65–172), and 19 of those rest on a **single** firing window — one transient excursion, not a cycle. Fixing that needs a "sustained for N windows" rule, which is a separate design question.
 
+> **RATIFIED AND FIXED (2026-08-03). `MinOscillatingWindows` (default 2)** now requires a run to fire in at least two post-burn-in windows before it may be called OSCILLATING; see the classifier section for the rule, the histogram it was chosen from, and why the count is total rather than consecutive.
+>
+> **The "19 of 87" figure above is pre-regrowth-fix and was NOT reused.** The ecology moved enough that it could not be — the same grid now gives 507 STABLE against 310 and 302 TIMEOUT against 484. Re-measured on the current code, **30 of the 108** surviving OSCILLATING runs rest on a single firing window: still the largest bucket by more than a factor of two, and still the defect, but a different number.
+>
+> **Where the 30 went.** All to the existing fallback order — 23 TIMEOUT and 7 DECLINING — and EXTINCT (189), STABLE (507) and OVERRUN (20) did not move by a single run, as they must not, because the rule is consulted only at the tick limit. Nothing landed anywhere surprising and the fallback order was not touched.
+>
+> **What was removed is the right thing.** Three cells account for 20 of the 30: `FoodRegrowTicks=600`/`BurnPerTick=4`, `800`/`3` and most of `200`/`5`. Every OSCILLATING run in them was a single-window run, and their smoothed trajectories make 0–4 large excursions in 10 800 ticks. A further 6 come from `800`/`5`, which *does* cycle but at a mean population of 38–41, well below the ratified 64-agent floor — those were surviving on a stray window that happened to clear it, which is the latch in its purest form.
+>
+> **What survives is also the right thing.** The genuine-cycle region keeps 75 of its 80 runs, and the canonical cell `FoodRegrowTicks=400`/`BurnPerTick=5` fires in 7–9 of its 9 evaluable windows — nowhere near the threshold.
+
 **5. The ratified defaults sit in a deliberately quiet region.** At `FoodRegrowTicks=200`, between the all-STABLE and mixed bands, a 1000-seed batch is 966 STABLE / 33 TIMEOUT / 1 DECLINING, with EXTINCT, OVERRUN and OSCILLATING unreachable and the peak at year 6 in all eight golden seeds. Moving `FoodRegrowTicks` one notch changes the distribution more than 1000 seeds do. **The defaults were not retuned** — they are the user's, and this map is the evidence for that decision rather than a licence to make it. Note for anyone exercising the classifier: use a sweep, not a seed batch. `FoodRegrowTicks` 300–500 is where STABLE, TIMEOUT and DECLINING coexist inside one cell.
 
 **6. Regrowth swept the board as a travelling front, and no statistic in the harness could see it.** Found at P5 by watching the viewer, not by reading a CSV: food appeared in long horizontal streaks and agents banded up behind them. `regrow` strode over raw cell indices, `for index := w.Tick % stride; index < cellCount; index += stride`, and the index runs along x first — so horizontally adjacent cells regrew exactly one tick apart and recovery moved across the grid as a front. The stride's own stated purpose (avoid a synchronised global *pulse*) was met; the spatial correlation was an unintended second consequence of the same line.
@@ -789,6 +844,7 @@ Method: a 45-cell sweep over `InitFoodPerCell` [1,3,5] × `ReproEnergyCost` [30,
 - **Sweeps (P4):** grid expansion and axis ordering; unknown axis key and unusable axis value rejected at load; invalid cell skipped while the rest run; every-cell-invalid is an error; cell aggregation checked against hand-built records; sweep output identical across worker counts for both the per-run file and the aggregate.
 - **Burn-in (P4):** a wild opening followed by a flat tail classifies STABLE; `BurnInWindows=0` reproduces the old behaviour with hard-coded expectations; a burn-in longer than the run yields TIMEOUT without panicking; each of the three predicates is separately shown to respect it; EXTINCT and OVERRUN still fire inside burn-in.
 - **High-variation population floor (post-P4):** a large-amplitude cycle at high population still classifies OSCILLATING while a small noisy remnant does not, and lands on TIMEOUT or DECLINING via the existing fallback; the boundary is exercised at exactly the floor, one below and one above; `MinOscillatingPopulation=0` reproduces the pre-floor behaviour with hard-coded expectations both on hand-built series and on the real simulation (golden seeds 1–8 plus a 36-run `FoodRegrowTicks` × `BurnPerTick` grid chosen to contain both a cell that must change and a cell that must not); a negative floor panics. **No existing classifier or burn-in test needed changing** — the pre-existing OSCILLATING series all swing about a mean of 1000, far above any plausible floor, which is itself evidence that the floor targets the right thing.
+- **Sustained oscillation (post-P5):** one firing window is TIMEOUT and two is OSCILLATING (the boundary either side of the default); the two firing windows need NOT be adjacent; the threshold is honoured above the default as well as at it; windows below the population floor do not count towards it, so the two gates on the flag compose per window; a full-length cycle fires in all nine evaluable windows and survives; `MinOscillatingWindows=1` reproduces the latching behaviour exactly, including that a firing window inside burn-in still counts for nothing; zero *and* negative both panic (unlike the two floors, where only negative does). End to end on the real simulation: six measured single-window runs across three cells lose OSCILLATING and land on the recorded TIMEOUT or DECLINING; eight runs across the two strongest genuine-cycle cells keep it; a run that reached STABLE despite having a firing window is unchanged, which pins that the rule cannot reach a terminal outcome. **Two existing test groups needed changing**, both by holding `MinOscillatingWindows` at its opt-out: the burn-in tests and the population-floor tests each drive series with a single firing window, so without that they would have passed for the new rule's reason rather than their own.
 - **GUI (P5):** `TestGUINeverMutates`. Rest verified manually — and the manual pass is what caught the travelling-front regrowth artefact that no statistic in the harness could see ("Experimental findings" item 6).
 - **Performance guards:** `BenchmarkStep`, `BenchmarkRun12000`, documented target ≈1 s per 12 000-tick run. Watch in review, not a hard failure.
 
@@ -831,6 +887,8 @@ The ≈1 s target is met with room to spare, but the **parallel scaling caveat i
 
 11b. **A population floor on the high-variation flag** (`MinOscillatingPopulation`, default 64), ratified after P4 and built before P5 — because the GUI puts the outcome on the HUD, where a lying label is far more visible. The coefficient of variation is scale-free, so without a floor a starving remnant of a dozen agents is reported as an oscillating ecology; see the classifier section for the rule and the derivation of 64, and "Experimental findings" item 4 for the before/after numbers. Rejected alternatives: an absolute amplitude floor (measured — amplitude does not separate the two populations), and removing the OSCILLATING outcome (genuine cycles do exist, at high burn and moderate regrowth, and the outcome is part of the CSV schema).
 
+11c. **A sustained-window requirement on the high-variation flag** (`MinOscillatingWindows`, default 2), ratified after P5. The flag latched: one firing window settled the verdict for a whole run, so a single transient excursion read as sustained oscillation, while STABLE had always had to earn three consecutive windows. See the classifier section for the rule, the firing-window histogram it was derived from, and the before/after grid. Rejected alternative: a **consecutive** streak, the exact mirror of `StableWindows` and the obvious first choice — measured and rejected because it compounds with `MinOscillatingPopulation`, so a real cycle sitting near the population floor has its streak reset by every trough and can never earn a verdict. `StableWindows` itself was deliberately **not** lifted into `sim.Config` alongside this knob; see the note in the classifier section.
+
 11. **Non-overlapping 1200-tick windows** rather than a per-tick sliding window. Only reading consistent with "3 consecutive windows (30 y)"; collapses the classifier to five O(1) accumulators, no ring buffer. A true sliding window with a 120-tick stride is a small change but needs int128 comparisons on every evaluation and a restated "3 consecutive" rule.
 12. **DECLINING threshold. Proposed:** slope·1200/mean < −0.10 (losing >10 % of window mean per window).
 13. **Phase-separated single buffer instead of a literal state copy.** Same guarantee, zero copy; a literal double buffer costs ~768 MB of memcpy per run for no added safety.
@@ -859,7 +917,9 @@ Tone modelled on `speedtest/CLAUDE.md` and `sgo/CLAUDE.md`, determinism contract
 7b. **External config** — the resolution order (default → `--config` file → `--set`); that `config_hash` is computed on the resolved config; that `--dump-config` is how you record an experiment; and the hard rule that **no simulation parameter may ever come from an environment variable**, with the reason (ambient, machine-local, invisibly divergent). Adding a field to `Config` means adding it to `Hash()`, `Validate()`, and the JSON tags — `TestConfigHashChangesWithEveryField` enforces the first. Also: parameter names resolve through exactly one function, `config.SetField`, shared by `--set` and sweep axis keys — never add a second name-matching path.
 7c. **Classifier burn-in** — `BurnInWindows` (default 1) excludes leading windows from every window predicate but not from the per-tick terminal checks; 0 reproduces the pre-burn-in behaviour; it is a classification parameter that lives in `Config` so it travels in `config_hash` and can be swept.
 
-7d. **The high-variation population floor** — `MinOscillatingPopulation` (default 64) is the mean population a window must reach before its coefficient of variation may count, because that coefficient is scale-free and a starving remnant clears the 0.25 line trivially. Same shape as burn-in: 0 opts out exactly, lives in `Config`, travels in `config_hash`, sweepable. With it, OSCILLATING now means a genuine large-amplitude cycle — but see the remaining caveat in "Experimental findings" item 4: a **single** transient excursion at high population can still latch the flag for a whole run.
+7d. **The high-variation population floor** — `MinOscillatingPopulation` (default 64) is the mean population a window must reach before its coefficient of variation may count, because that coefficient is scale-free and a starving remnant clears the 0.25 line trivially. Same shape as burn-in: 0 opts out exactly, lives in `Config`, travels in `config_hash`, sweepable.
+
+7e. **The sustained-window requirement** — `MinOscillatingWindows` (default 2) is how many post-burn-in windows must clear the high-variation predicate before a run may be called OSCILLATING, because without it one transient excursion latched the flag for a whole run. Same shape as the other two classification knobs (lives in `Config`, travels in `config_hash`, sweepable) with **one trap worth stating explicitly: its opt-out is 1, not 0**, and 0 is rejected. The count is TOTAL firing windows, not a consecutive streak — do not "fix" it to match `StableWindows`; the reason is measured and is in the classifier section. With burn-in, the population floor and this rule together, OSCILLATING finally means a sustained large-amplitude cycle at a meaningful population.
 8. **CLI surface and commands** — flag table (including `--sweep`), `make` targets, the `nogui` build tag.
 9. **Output schema** — CSV columns; that `wall_ms` is the one non-deterministic column and every consumer must exclude it (two runs at different worker counts differ in that column and nothing else); the sweep's appended axis columns and the two extra files (`<out>.config.json`, `<out>.cells.csv`); the meaning of `config_hash`, that it is per-row and per-cell, and that records with differing `config_hash` are not comparable.
 10. **Conventions** — no maps; integer only; `sort.SliceStable` by ID; hash canonical state only, never derived caches (and why); `.code-review-graph/` gitignored; `.env` carries only `PRJ`/`VERSION`, never simulation parameters.

@@ -66,6 +66,20 @@ type Config struct {
 	// the default. Zero opts out.
 	MinOscillatingPopulation int32 `json:"MinOscillatingPopulation"`
 
+	// MinOscillatingWindows is a CLASSIFICATION parameter on the same footing
+	// as the two above: the simulation never reads it, it cannot move a state
+	// hash, and it lives here so that it travels in config_hash and can be
+	// swept by name.
+	//
+	// It is how many windows must clear the high-variation predicate before a
+	// run may be called OSCILLATING. Without it a single transient excursion
+	// latches the verdict for the whole run.
+	//
+	// See stats.ClassifierConfig.MinOscillatingWindows for the derivation of
+	// the default. One — not zero — is the opt-out, and reproduces the
+	// latching behaviour exactly.
+	MinOscillatingWindows int32 `json:"MinOscillatingWindows"`
+
 	Verify bool `json:"Verify"`
 }
 
@@ -105,6 +119,7 @@ func DefaultConfig() Config {
 
 		BurnInWindows:            1,
 		MinOscillatingPopulation: 64,
+		MinOscillatingWindows:    2,
 
 		Verify: false,
 	}
@@ -167,6 +182,16 @@ func (c Config) Validate() error {
 		return &ConfigError{
 			Field:  "MinOscillatingPopulation",
 			Reason: "must not be negative (0 disables the high-variation population floor)",
+		}
+	}
+	// Unlike the two above, this knob's opt-out is 1, not 0: 1 means "one
+	// firing window is enough", which is the un-sustained rule. Zero would
+	// resolve every non-stable run as OSCILLATING, so it is rejected rather
+	// than read as an opt-out.
+	if c.MinOscillatingWindows < 1 {
+		return &ConfigError{
+			Field:  "MinOscillatingWindows",
+			Reason: "must be positive (1 disables the sustained-oscillation requirement)",
 		}
 	}
 
@@ -253,6 +278,7 @@ func (c Config) Hash() uint64 {
 	hash = mixInt32(hash, c.SearchRadius)
 	hash = mixInt32(hash, c.BurnInWindows)
 	hash = mixInt32(hash, c.MinOscillatingPopulation)
+	hash = mixInt32(hash, c.MinOscillatingWindows)
 	hash = mixBool(hash, c.Verify)
 
 	return hash

@@ -12,14 +12,20 @@ func TestDefaultConfigIsValid(t *testing.T) {
 	}
 }
 
-// TestClassificationKnobsAcceptZero pins the opt-out that both classification
-// parameters promise. Zero is not merely tolerated, it is the documented way to
-// disable each feature and reproduce the behaviour from before it existed, so a
-// stray move into the positive-values list would silently break that contract.
-func TestClassificationKnobsAcceptZero(t *testing.T) {
+// TestClassificationKnobsAcceptTheirOptOut pins the opt-out that every
+// classification parameter promises. The disabling value is not merely
+// tolerated, it is the documented way to reproduce the behaviour from before
+// each feature existed, so a stray move into the positive-values list would
+// silently break that contract.
+//
+// The opt-out is zero for the two floors and ONE for MinOscillatingWindows,
+// because that knob counts windows and its disabling value is "one window is
+// enough". Zero there would not weaken the rule, it would invert it.
+func TestClassificationKnobsAcceptTheirOptOut(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.BurnInWindows = 0
 	cfg.MinOscillatingPopulation = 0
+	cfg.MinOscillatingWindows = 1
 
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate() rejected the opt-out values: %v", err)
@@ -55,12 +61,22 @@ func TestValidateRejects(t *testing.T) {
 		{"regrow ticks above max tick", "FoodRegrowTicks", func(c *Config) { c.MaxTick = 100 }},
 		{"more agents than cells", "InitAgents", func(c *Config) { c.InitAgents = 20000 }},
 		{"search radius above grid", "SearchRadius", func(c *Config) { c.SearchRadius = 200 }},
-		// The two classification knobs are checked outside the positive list,
-		// because zero is legal and meaningful for both. Only negatives are
-		// rejected.
+		// The classification knobs are checked outside the positive list,
+		// because their legal ranges differ from it. Zero is legal and
+		// meaningful for the two floors, so only negatives are rejected there.
 		{"negative burn-in windows", "BurnInWindows", func(c *Config) { c.BurnInWindows = -1 }},
 		{"negative oscillation floor", "MinOscillatingPopulation", func(c *Config) {
 			c.MinOscillatingPopulation = -1
+		}},
+		// MinOscillatingWindows is the exception: its opt-out is 1, so zero is
+		// rejected as well. Zero would satisfy "at least zero windows fired"
+		// for every run and make OSCILLATING the universal fallback — a config
+		// that runs happily and mislabels the whole sweep.
+		{"zero oscillating windows", "MinOscillatingWindows", func(c *Config) {
+			c.MinOscillatingWindows = 0
+		}},
+		{"negative oscillating windows", "MinOscillatingWindows", func(c *Config) {
+			c.MinOscillatingWindows = -1
 		}},
 	}
 

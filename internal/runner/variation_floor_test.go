@@ -17,6 +17,12 @@ import (
 // trajectory; see each table's comment. The guarantee they encode is unchanged:
 // MinOscillatingPopulation=0 must be an exact opt-out.
 //
+// Every config built here holds MinOscillatingWindows at its own opt-out of 1,
+// via floorTestConfig below. These tests isolate the POPULATION floor; the
+// sustained-window rule is a second, independent gate on the same flag, and
+// leaving it at its default would let it decide cases this file attributes to
+// the floor. sustained_oscillation_test.go covers that rule on its own.
+//
 // See stats.ClassifierConfig.MinOscillatingPopulation for what the floor is and
 // how its default was derived.
 
@@ -124,9 +130,17 @@ var sweepOutcomesWithoutTheFloor = []struct {
 	{regrow: 6400, burn: 5, seed: 4, want: "EXTINCT"},
 }
 
+// floorTestConfig is the default config with the sustained-window rule opted
+// out, so that the high-variation flag is gated by the population floor alone.
+func floorTestConfig() sim.Config {
+	cfg := sim.DefaultConfig()
+	cfg.MinOscillatingWindows = 1
+	return cfg
+}
+
 // sweepConfig builds one cell of the grid above.
 func sweepConfig(regrow int32, burn int16) sim.Config {
-	cfg := sim.DefaultConfig()
+	cfg := floorTestConfig()
 	cfg.FoodRegrowTicks = regrow
 	cfg.BurnPerTick = burn
 	return cfg
@@ -136,7 +150,7 @@ func sweepConfig(regrow int32, burn int16) sim.Config {
 // the real simulation: with MinOscillatingPopulation=0 the eight golden seeds
 // must classify exactly as the recorded table says.
 func TestHighVariationFloorZeroReproducesTheGoldenSeeds(t *testing.T) {
-	cfg := sim.DefaultConfig()
+	cfg := floorTestConfig()
 	cfg.MinOscillatingPopulation = 0
 
 	for _, testCase := range goldenSeedOutcomesWithoutTheFloor {
@@ -167,7 +181,7 @@ func TestHighVariationFloorZeroReproducesASweepGrid(t *testing.T) {
 // consult the high-variation flag, so the floor is inert there — which is what
 // makes it safe to turn on by default.
 func TestHighVariationFloorDefaultDoesNotDisturbTheGoldenSeeds(t *testing.T) {
-	cfg := sim.DefaultConfig()
+	cfg := floorTestConfig()
 
 	for _, testCase := range goldenSeedOutcomesWithoutTheFloor {
 		if got := classifyRun(t, cfg, testCase.seed); got != testCase.want {
