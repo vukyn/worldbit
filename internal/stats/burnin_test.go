@@ -66,8 +66,15 @@ func TestBurnInLetsAWildOpeningSettle(t *testing.T) {
 //
 // The same series with one burn-in window falls through to TIMEOUT, which is
 // the honest description of a run that settled too late to prove it.
+//
+// MinOscillatingWindows is held at its opt-out throughout, so that the only
+// thing separating the two halves is burn-in. The sustained-oscillation rule
+// would suppress this series on its own — the boom is a single window — and
+// letting it do so would make this test pass for a reason that has nothing to
+// do with what it is named after.
 func TestBurnInStopsOscillatingBeingTheDefaultVerdict(t *testing.T) {
 	params := DefaultClassifierConfig()
+	params.MinOscillatingWindows = 1
 	samples := concatSeries(
 		boomSeries(params.WindowTicks),
 		constantSeries(700, 2*params.WindowTicks),
@@ -163,9 +170,15 @@ func TestBurnInExcludesEveryPredicate(t *testing.T) {
 // The expectations here are hard-coded rather than derived, so that a future
 // change to the burn-in machinery that quietly altered the zero case would
 // fail rather than move the goalposts with itself.
+//
+// "Before burn-in existed" also means before the sustained-oscillation rule
+// existed, so MinOscillatingWindows is held at its own opt-out. Otherwise the
+// boom case below would resolve TIMEOUT for a second, unrelated reason and this
+// test would no longer be about BurnInWindows=0 at all.
 func TestBurnInZeroIsExactlyTheOldBehaviour(t *testing.T) {
 	params := DefaultClassifierConfig()
 	params.BurnInWindows = 0
+	params.MinOscillatingWindows = 1
 	window := params.WindowTicks
 
 	cases := []struct {

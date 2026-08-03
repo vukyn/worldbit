@@ -215,6 +215,48 @@ below a mean of 8 fire and their variation is indistinguishable from pure noise.
 Like `BurnInWindows`, it is a classification parameter that cannot move a state
 hash, and lives in `Config` so it travels in `config_hash` and can be swept.
 
+### Sustained oscillation
+
+The population floor decides whether a window's variation *means* anything. It
+says nothing about how many such windows a run needs, and without an answer to
+that the flag **latches**: one window clearing the predicate settles the verdict
+for the whole run, so a single transient excursion reads as sustained
+oscillation. STABLE has always had to earn its verdict over three consecutive
+windows; OSCILLATING earned it on one sample.
+
+Measured on the 1200-run `FoodRegrowTicks` × `BurnPerTick` grid, that was the
+common case rather than a corner: **30 of the 108 OSCILLATING runs rested on
+exactly one firing window** out of nine evaluable ones, more than twice any
+other bucket.
+
+| Firing windows | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |
+|---|---|---|---|---|---|---|---|---|---|
+| Runs | **30** | 13 | 8 | 5 | 8 | 11 | 10 | 5 | 18 |
+
+`MinOscillatingWindows` (default **2**) is how many windows must clear the
+high-variation predicate before a run may resolve as OSCILLATING. Two is the
+smallest threshold that removes the spike, and the spike is the only feature of
+the distribution worth cutting at — nothing comparable happens at 3 or 4, where
+a higher threshold would start costing genuine cycles instead. It takes
+OSCILLATING from 108 runs to 78 on that grid; the 30 removed runs fall through
+the existing fallback order to TIMEOUT (23) and DECLINING (7), and EXTINCT,
+STABLE and OVERRUN are untouched because the rule is consulted only at the tick
+limit. The genuine-cycle region keeps 75 of its 80 runs.
+
+The count is the **total** number of firing windows, *not* a consecutive streak
+— the one place this rule deliberately departs from the stable streak it
+otherwise mirrors. A consecutive rule would interact with the population floor:
+a cycle whose mean sits near the floor fails the floor in its trough windows, so
+every trough resets the streak and a real cycle can never build one. Measured,
+the cell `FoodRegrowTicks=600` / `BurnPerTick=5` — an unambiguous cycle at a mean
+population of 52–56 against a floor of 64 — keeps 18 of 20 runs under a total
+rule of 2 and only 4 of 20 under a consecutive rule of 2.
+
+Note the opt-out value: it is **1**, not 0, because the test is "at least N
+windows fired". `--set MinOscillatingWindows=1` reproduces the latching
+behaviour exactly. Zero is rejected by `Validate()` — it would satisfy "at least
+zero fired" for every run and make OSCILLATING the universal fallback.
+
 ### Replaying a seed
 
 Run the batch, pick a seed whose outcome looks interesting, then re-simulate it
@@ -338,12 +380,13 @@ EXTINCT needs a metabolic squeeze rather than a food one: `BurnPerTick=5`
 extinguishes every seed at `FoodRegrowTicks` ≥ 1600.
 
 **Genuine oscillation lives at high burn and moderate regrowth**, a region the
-first sweep did not cover: `BurnPerTick=5` with `FoodRegrowTicks` 300–800
-produces a real limit cycle, 20/20 seeds, with the population swinging roughly
-between a third and double the carrying capacity about a stationary mean, window
-after window for the whole run. At `FoodRegrowTicks=400` that is a swing of about
-30–180 around a mean of 82. These survive the population floor; the starving
-remnants at slow regrowth do not.
+first sweep did not cover: `BurnPerTick=5` with `FoodRegrowTicks` 300–600
+produces a real limit cycle, with the population swinging roughly between a third
+and double the carrying capacity about a stationary mean, window after window for
+the whole run. At `FoodRegrowTicks=400` that is a swing of about 30–180 around a
+mean of 82. These survive both the population floor and the sustained-window
+rule — 75 of the region's 80 runs — while the starving remnants at slow regrowth
+and the single-excursion runs elsewhere do not.
 
 The **defaults sit at `FoodRegrowTicks=200`**, between the all-STABLE and mixed
 bands. A 1000-seed batch there is now **1000 STABLE** — before the

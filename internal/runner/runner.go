@@ -78,6 +78,7 @@ func ClassifierParams(cfg sim.Config) stats.ClassifierConfig {
 	params.OverrunPopulation = stats.OverrunPopulationFor(int(cfg.Width) * int(cfg.Height))
 	params.BurnInWindows = int(cfg.BurnInWindows)
 	params.MinOscillatingPopulation = int(cfg.MinOscillatingPopulation)
+	params.MinOscillatingWindows = int(cfg.MinOscillatingWindows)
 	return params
 }
 

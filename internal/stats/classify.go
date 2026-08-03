@@ -16,12 +16,13 @@ const (
 	// OutcomeStable means three consecutive windows were low-variation and
 	// flat, with a population above the floor. Terminal.
 	OutcomeStable
-	// OutcomeOscillating means at least one window had a coefficient of
-	// variation above 0.25 AT A POPULATION LARGE ENOUGH FOR THAT TO MEAN
-	// SOMETHING, and the run never stabilised. See
-	// ClassifierConfig.MinOscillatingPopulation for the floor and why an
-	// unfloored version of this outcome labelled starving remnants as
-	// oscillating ecologies.
+	// OutcomeOscillating means enough windows had a coefficient of variation
+	// above 0.25 AT A POPULATION LARGE ENOUGH FOR THAT TO MEAN SOMETHING, and
+	// the run never stabilised. See ClassifierConfig.MinOscillatingPopulation
+	// for the population floor and why an unfloored version of this outcome
+	// labelled starving remnants as oscillating ecologies, and
+	// ClassifierConfig.MinOscillatingWindows for how many such windows "enough"
+	// is and why one is not.
 	OutcomeOscillating
 	// OutcomeOverrun means the population passed the overrun threshold.
 	// Terminal, like extinction: such a run costs an order of magnitude more
@@ -124,6 +125,44 @@ type ClassifierConfig struct {
 	// see Window.MeanAtLeast. Zero opts out entirely and reproduces the
 	// un-floored behaviour exactly.
 	MinOscillatingPopulation int
+	// MinOscillatingWindows is how many windows must clear the high-variation
+	// predicate before a run may resolve as OSCILLATING — the temporal mirror
+	// of StableWindows, which STABLE has always had to earn.
+	//
+	// Without it the flag LATCHES: one window clearing the predicate settles
+	// the verdict for the whole run, so a single transient excursion reads as
+	// sustained oscillation. Measured on the 1200-run FoodRegrowTicks x
+	// BurnPerTick grid, that was not a corner case — 30 of the 108 OSCILLATING
+	// runs rested on exactly ONE firing window out of nine evaluable ones, more
+	// than twice any other bucket of the distribution:
+	//
+	//	firing windows  1   2   3   4   5   6   7   8   9
+	//	runs           30  13   8   5   8  11  10   5  18
+	//
+	// The spike at one is the latch signature, and it is where three whole
+	// sweep cells live that no reading of their trajectory calls a cycle. The
+	// default of 2 is the smallest threshold that removes it, and it is chosen
+	// against the SHAPE of that distribution rather than tuned: nothing
+	// comparable happens at 2, 3 or 4, so a higher threshold buys no further
+	// separation and starts costing genuine cycles. See DefaultClassifierConfig.
+	//
+	// The count is TOTAL firing windows, NOT a consecutive streak, and that is
+	// the one place this rule deliberately departs from StableWindows. A
+	// consecutive rule interacts with MinOscillatingPopulation: a cycle whose
+	// mean sits near the population floor fails the floor in its trough
+	// windows, so every trough resets the streak and a real cycle can never
+	// build one. That is not hypothetical — the measured cell
+	// FoodRegrowTicks=600 / BurnPerTick=5 (mean population 52-56 against a
+	// floor of 64, 13-15 large excursions per run) keeps 18 of 20 runs under a
+	// total rule of 2 and 4 of 20 under a consecutive rule of 2. Requiring
+	// windows to be consecutive would make the verdict depend on where the
+	// cycle happens to sit relative to a different threshold.
+	//
+	// One is the opt-out: it makes the test "at least one window fired", which
+	// is exactly the latching behaviour, reproduced exactly. Values below one
+	// are rejected; zero would resolve every unstable run as OSCILLATING, which
+	// is not a weaker rule but a different and nonsensical one.
+	MinOscillatingWindows int
 	// OverrunPopulation is the population that must be EXCEEDED to resolve a
 	// run as OVERRUN. See OverrunPopulationFor.
 	OverrunPopulation int
@@ -153,8 +192,9 @@ type ClassifierConfig struct {
 
 // DefaultClassifierConfig returns the ratified thresholds: 1200-tick windows
 // (ten years at the default 120 ticks per year), three consecutive stable
-// windows, a 20-agent stability floor, a 64-agent high-variation floor, one
-// burn-in window, and the overrun threshold for the default 128x128 grid.
+// windows, a 20-agent stability floor, a 64-agent high-variation floor, two
+// high-variation windows, one burn-in window, and the overrun threshold for the
+// default 128x128 grid.
 //
 // The 64-agent high-variation floor is derived, not chosen by feel. The
 // predicate compares the coefficient of variation against 0.25; demographic
@@ -168,7 +208,20 @@ type ClassifierConfig struct {
 // maximises agreement with an independent label for sustained non-noise
 // variation around a stationary mean, and the agreement curve is flat between
 // 48 and 72, so the value is not knife-edge. It cuts OSCILLATING from 308 runs
-// to 87 while keeping 61 of the 68 genuinely cycling ones.
+// to 87 while keeping 61 of the 68 genuinely cycling ones. (Those two counts
+// predate the regrowth-permutation fix and are not comparable with the numbers
+// below, which were measured after it.)
+//
+// The two-window sustained requirement is derived the same way, on the same
+// 1200-run grid re-measured after that fix. It cuts OSCILLATING from 108 runs
+// to 78, and every one of the 30 it removes had exactly one firing window. It
+// leaves the genuine-cycle region — BurnPerTick=5 with FoodRegrowTicks 300-600,
+// where the population swings around a stationary mean for the whole run — at
+// 75 of its 80 runs, so it removes the latch without touching what the label is
+// for. Against an independent trajectory-shape label (large excursions counted
+// off the smoothed series, which knows nothing about the window grid) two is
+// also the best of the candidates, at 12 disagreements out of 108 against 15
+// for three and 23 for four. See ClassifierConfig.MinOscillatingWindows.
 func DefaultClassifierConfig() ClassifierConfig {
 	return ClassifierConfig{
 		WindowTicks:              1200,
@@ -176,6 +229,7 @@ func DefaultClassifierConfig() ClassifierConfig {
 		StableWindows:            3,
 		MinStablePopulation:      20,
 		MinOscillatingPopulation: 64,
+		MinOscillatingWindows:    2,
 		OverrunPopulation:        OverrunPopulationFor(128 * 128),
 		BurnInWindows:            1,
 	}
@@ -223,10 +277,11 @@ type Classifier struct {
 	windowsClosed int
 
 	// A window's coefficient of variation is only ever compared against 0.25,
-	// so "the maximum CV over all windows exceeded 0.25" is exactly "some
-	// window exceeded 0.25" — one bool instead of a rational running maximum
-	// that could not be represented without floats or big.Rat.
-	sawHighVariation bool
+	// so no running maximum is needed — which is what keeps this package free
+	// of floats and big.Rat. What is needed is HOW MANY windows cleared the
+	// line, because one is not enough to call a run oscillating; see
+	// ClassifierConfig.MinOscillatingWindows.
+	highVariationWindows int
 
 	// Likewise, only the LAST window's slope is consulted at the tick limit,
 	// so the predicate is evaluated at each boundary and overwritten.
@@ -256,6 +311,13 @@ func NewClassifier(params ClassifierConfig) *Classifier {
 	if params.MinOscillatingPopulation < 0 {
 		panic("stats: MinOscillatingPopulation must not be negative, got " +
 			strconv.Itoa(params.MinOscillatingPopulation))
+	}
+	// One, not zero, is the opt-out here: zero would make the OSCILLATING
+	// branch fire on a run with no high-variation window at all, which is not a
+	// weaker rule but a different and nonsensical one.
+	if params.MinOscillatingWindows < 1 {
+		panic("stats: MinOscillatingWindows must be positive, got " +
+			strconv.Itoa(params.MinOscillatingWindows))
 	}
 
 	return &Classifier{
@@ -355,8 +417,12 @@ func (c *Classifier) evaluateWindow(population int) {
 	// small-number noise. Without the floor, a starving remnant of a dozen
 	// agents latches this flag and the run is reported as OSCILLATING; see
 	// ClassifierConfig.MinOscillatingPopulation.
-	c.sawHighVariation = c.sawHighVariation ||
-		(c.window.HighVariation() && c.window.MeanAtLeast(c.params.MinOscillatingPopulation))
+	// Deliberately a TOTAL count and not a consecutive streak, unlike the
+	// stable streak above; see ClassifierConfig.MinOscillatingWindows.
+	if c.window.HighVariation() && c.window.MeanAtLeast(c.params.MinOscillatingPopulation) {
+		c.highVariationWindows++
+	}
+
 	c.lastWindowDeclining = c.window.DecliningSlope()
 }
 
@@ -373,7 +439,7 @@ func (c *Classifier) Finish() Outcome {
 	}
 
 	switch {
-	case c.sawHighVariation:
+	case c.highVariationWindows >= c.params.MinOscillatingWindows:
 		c.outcome = OutcomeOscillating
 	case c.lastWindowDeclining:
 		c.outcome = OutcomeDeclining
@@ -425,3 +491,8 @@ func (c *Classifier) BurnInWindows() int { return c.params.BurnInWindows }
 // StableStreak is the number of consecutive stable windows ending at the most
 // recent boundary.
 func (c *Classifier) StableStreak() int { return c.stableStreak }
+
+// HighVariationWindows is how many post-burn-in windows cleared both the
+// coefficient-of-variation line and the population floor. See
+// ClassifierConfig.MinOscillatingWindows.
+func (c *Classifier) HighVariationWindows() int { return c.highVariationWindows }
