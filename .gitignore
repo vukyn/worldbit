@@ -26,7 +26,12 @@ out/
 *.cells.csv
 
 # Agent-local memory (never committed)
-# Machine-local Claude state — worktrees and caches — EXCEPT agent-memory,
-# which is knowledge about this repo and has to travel with it.
-.claude/*
-!.claude/agent-memory/
+# Machine-local Claude state. Everything is ignored EXCEPT the repo-root
+# agent-memory, which is knowledge about this repo and has to travel with it.
+# ⚠️ A .claude/ below the root is a store an agent made because a session's cwd
+# was a subdirectory — same knowledge, invisible to the repo's own agent. Those
+# stay ignored; consolidate their notes into the root store instead.
+**/.claude/
+!/.claude/
+/.claude/*
+!/.claude/agent-memory
